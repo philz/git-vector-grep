@@ -8,6 +8,20 @@ It indexes the current state of a git repo into a per-repo SQLite cache
 model via [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), and
 performs cosine top-k search against an in-memory float32 matrix.
 
+## Two backends
+
+- **Local (default)**: ONNX via `fastembed-rs`, default model
+  `sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, ~85 MB).
+  Override with `--model {minilm,bge-small,bge-base,jina-code,jina-en,...}`.
+- **Remote**: any OpenAI-compatible `/v1/embeddings` endpoint, with up to
+  `GVG_REMOTE_CONCURRENCY` parallel HTTP requests.
+  Default points at the exe.dev LLM gateway
+  (`https://llm.int.exe.xyz/v1`) using `openai/text-embedding-3-small`
+  truncated to 512-D via Matryoshka (`--remote-dim`). Enable with `--remote`.
+
+On an exe.dev VM with only 2 CPUs, `--remote` is roughly **60× faster**
+than local CPU embedding on a cold index.
+
 ## Why it's fast
 
 - **The cache key is the git blob SHA** that `git ls-files -s` already prints.
@@ -63,6 +77,17 @@ The cache **self-invalidates** if the model id or dim changes.
   paths, which is what makes rename detection free.
 - **Embeddings** are L2-normalized at write time so search is a plain dot
   product.
+
+## Benchmark (arcaneum, 272 files, 6646 chunks, 2-CPU VM)
+
+| Phase | Local minilm | Remote text-embedding-3-small |
+|---|---:|---:|
+| Cold index | ~6 min | **7.7 s** |
+| Incremental, clean tree | 0.3 s | **0.017 s** |
+| Rename one file | 0.3 s | 0.02 s |
+| Modify one file | 3.8 s | 0.5 s |
+| Top-10 cosine scan | 0.5 ms | 0.5 ms |
+| Search end-to-end | ~300 ms | **~300 ms** |
 
 ## Inspiration
 

@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use crate::cache::Cache;
 use crate::chunker::{chunk_bytes, Chunk};
-use crate::embedder::Embedder;
+use crate::embedder::AnyEmbedder;
 use crate::repo::{git_blob_sha1, list_tracked, looks_textual, modified_paths};
 
 #[derive(Default, Debug)]
@@ -60,7 +60,7 @@ impl std::fmt::Display for IndexStats {
 pub fn index_repo(
     root: &Path,
     cache: &mut Cache,
-    embedder: &mut Embedder,
+    embedder: &mut AnyEmbedder,
     batch_size: usize,
     verbose: bool,
 ) -> Result<IndexStats> {
@@ -282,7 +282,20 @@ pub fn index_repo(
                 blob_order.len()
             );
         }
-        flat_vecs = embedder.embed_flat(flat_texts, batch_size)?;
+        // Length-bucketed batching: sort by byte length so each ONNX batch has
+        // similar sequence lengths, minimizing padding. Then scatter vectors
+        // back to the original positions.
+        let n_flat = flat_texts.len();
+        let mut order: Vec<usize> = (0..n_flat).collect();
+        order.sort_by_key(|&i| flat_texts[i].len());
+        let sorted_texts: Vec<String> = order.iter().map(|&i| flat_texts[i].clone()).collect();
+        let sorted_vecs = embedder.embed_flat(sorted_texts, batch_size)?;
+        let dim = embedder.dim();
+        flat_vecs = vec![0f32; n_flat * dim];
+        for (sorted_pos, &orig_pos) in order.iter().enumerate() {
+            flat_vecs[orig_pos * dim..(orig_pos + 1) * dim]
+                .copy_from_slice(&sorted_vecs[sorted_pos * dim..(sorted_pos + 1) * dim]);
+        }
     }
 
     // 5. Apply: write embeddings and upsert file rows for all classified files.
@@ -309,7 +322,7 @@ pub fn index_repo(
                         .iter()
                         .map(|c| (c.start_line, c.end_line))
                         .collect();
-                    let dim = embedder.dim;
+                    let dim = embedder.dim();
                     let vec_slice = &flat_vecs[start * dim..(start + n) * dim];
                     cache.insert_chunks(&sha, &lines, vec_slice, dim)?;
                     stats.chunks_embedded += n;

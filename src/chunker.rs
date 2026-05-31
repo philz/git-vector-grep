@@ -5,11 +5,13 @@
 
 use memchr::memchr;
 
-pub const TARGET_LINES: usize = 40;
-pub const OVERLAP_LINES: usize = 8;
-pub const MAX_CHARS: usize = 4000;
+// Tuned for MiniLM-/BGE-class encoders (512-token max).
+// Smaller chunks = less padding per batch = faster CPU inference.
+pub const TARGET_LINES: usize = 20;
+pub const OVERLAP_LINES: usize = 4;
+pub const MAX_CHARS: usize = 1000;
 pub const MIN_FILE_BYTES: usize = 16;
-pub const MAX_FILE_BYTES: usize = 2_000_000;
+pub const MAX_FILE_BYTES: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {

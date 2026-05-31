@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::cache::Cache;
-use crate::embedder::Embedder;
+use crate::embedder::{AnyEmbedder, Embedder, RemoteEmbedder};
 use crate::indexer::index_repo;
 use crate::repo::find_repo_root;
 use crate::search::Index;
@@ -26,12 +26,28 @@ struct Cli {
     repo: Option<PathBuf>,
 
     /// Embedding model: jina-code (default), jina-en, bge-small, bge-base, minilm.
-    #[arg(long, global = true, default_value = "bge-small")]
+    #[arg(long, global = true, default_value = "minilm")]
     model: String,
 
     /// Override ONNX intra-op threads (default: all cores).
     #[arg(long, global = true)]
     threads: Option<usize>,
+
+    /// Use the exe.dev LLM gateway for embeddings instead of local ONNX.
+    /// Much faster on small VMs; requires network. The cache is keyed by
+    /// `--remote-model` so it won't collide with local-model caches.
+    #[arg(long, global = true)]
+    remote: bool,
+
+    /// Remote embedding model id (default: openai/text-embedding-3-small).
+    #[arg(long, global = true, default_value = "openai/text-embedding-3-small")]
+    remote_model: String,
+
+    /// Remote embedding dim (default 512: a Matryoshka truncation of
+    /// text-embedding-3-small that keeps most of the quality at 1/3 the
+    /// storage).
+    #[arg(long, global = true, default_value_t = 512)]
+    remote_dim: usize,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -79,6 +95,17 @@ fn cache_path(root: &Path) -> PathBuf {
     root.join(".git").join("vector-grep").join("index.sqlite")
 }
 
+fn build_embedder(cli: &Cli) -> Result<AnyEmbedder> {
+    if cli.remote {
+        Ok(AnyEmbedder::Remote(RemoteEmbedder::exe_gateway(
+            &cli.remote_model,
+            cli.remote_dim,
+        )))
+    } else {
+        Ok(AnyEmbedder::Local(Embedder::new(&cli.model, cli.threads)?))
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let start_dir = cli.repo.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -87,12 +114,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index { verbose, batch_size } => {
             let t0 = Instant::now();
-            let mut emb = Embedder::new(&cli.model, cli.threads)?;
-            let mut c = Cache::open(&cache_path(&root), &emb.model_id, emb.dim)?;
+            let mut emb = build_embedder(&cli)?;
+            let mut c = Cache::open(&cache_path(&root), emb.model_id(), emb.dim())?;
             if verbose {
                 eprintln!(
                     "[index] repo={} model={} dim={}",
-                    root.display(), emb.model_id, emb.dim
+                    root.display(), emb.model_id(), emb.dim()
                 );
             }
             let stats = index_repo(&root, &mut c, &mut emb, batch_size, verbose)?;
@@ -100,9 +127,9 @@ fn main() -> Result<()> {
             eprintln!("[index] wall: {:.2}s", t0.elapsed().as_secs_f64());
         }
         Cmd::Search {
-            query,
+            ref query,
             top_k,
-            path,
+            ref path,
             show,
             no_auto_index,
             json,
@@ -113,8 +140,8 @@ fn main() -> Result<()> {
             let q = query.join(" ");
             anyhow::ensure!(!q.is_empty(), "query is empty");
 
-            let mut emb = Embedder::new(&cli.model, cli.threads)?;
-            let mut c = Cache::open(&cache_path(&root), &emb.model_id, emb.dim)?;
+            let mut emb = build_embedder(&cli)?;
+            let mut c = Cache::open(&cache_path(&root), emb.model_id(), emb.dim())?;
 
             if !no_auto_index {
                 let stats = index_repo(&root, &mut c, &mut emb, batch_size, verbose)?;
@@ -190,9 +217,13 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats {} => {
-            // Open without loading the model.
-            let (_e, id, dim) = embedder::parse_model(&cli.model)?;
             let cp = cache_path(&root);
+            let (id, dim) = if cli.remote {
+                (cli.remote_model.as_str(), cli.remote_dim)
+            } else {
+                let (_e, id, dim) = embedder::parse_model(&cli.model)?;
+                (id, dim)
+            };
             let c = Cache::open(&cp, id, dim).context("open cache")?;
             let n_files: i64 = c
                 .conn

@@ -118,7 +118,22 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Extensions / filenames we treat as "likely textual code-or-docs".
+/// Skip common machine-generated / huge / not-useful-to-grep paths.
+fn is_excluded(path: &str) -> bool {
+    const SUBSTR: &[&str] = &[
+        "/node_modules/", "/vendor/", "/target/", "/dist/", "/build/",
+        "/.git/", "/.next/", "/.venv/", "/__pycache__/",
+        ".min.js", ".min.css", ".map", ".lock",
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "go.sum", "Cargo.lock", "poetry.lock", "uv.lock", "composer.lock",
+    ];
+    SUBSTR.iter().any(|p| path.contains(p))
+}
+
 pub fn looks_textual(path: &str) -> bool {
+    if is_excluded(path) {
+        return false;
+    }
     let lower = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     const NO_EXT_NAMES: &[&str] = &[
         "makefile", "dockerfile", "jenkinsfile", "readme", "license",
