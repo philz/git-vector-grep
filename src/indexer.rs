@@ -21,10 +21,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::cache::Cache;
 use crate::chunker::{chunk_bytes, Chunk};
 use crate::embedder::AnyEmbedder;
 use crate::repo::{git_blob_sha1, list_tracked, looks_textual, modified_paths};
+use crate::store::Store;
 
 #[derive(Default, Debug)]
 pub struct IndexStats {
@@ -59,7 +59,7 @@ impl std::fmt::Display for IndexStats {
 
 pub fn index_repo(
     root: &Path,
-    cache: &mut Cache,
+    cache: &mut Store,
     embedder: &mut AnyEmbedder,
     batch_size: usize,
     verbose: bool,
@@ -77,7 +77,7 @@ pub fn index_repo(
     let modified: HashSet<String> = modified_paths(root)?.into_iter().collect();
 
     // 3. load cache state.
-    let cache_files = cache.load_files()?;
+    let cache_files: HashMap<String, crate::store::FileRow> = cache.load_files().clone();
     let known_blobs = cache.known_blob_shas()?;
 
     // Classify each tracked file.
@@ -201,7 +201,7 @@ pub fn index_repo(
                         ld.mtime_ns,
                         ld.size,
                         c.n_chunks,
-                    )?;
+                    );
                 }
                 stats.files_unchanged += 1;
                 actions.push((ld.path, Action::Unchanged));
@@ -303,31 +303,23 @@ pub fn index_repo(
         match action {
             Action::Unchanged | Action::Skip => {}
             Action::ReuseBlob(sha, mt, sz, n) => {
-                cache.upsert_file(&path, &sha, mt, sz, n)?;
+                cache.upsert_file(&path, &sha, mt, sz, n);
             }
             Action::Embed(sha, chunks, mt, sz) => {
                 let (start, n) = blob_offsets[&sha];
-                // Only one path actually owns the embedding work for this sha.
-                // But every path with the same sha needs a files row.
-                if !cache
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM chunks WHERE blob_sha=? LIMIT 1",
-                        rusqlite::params![&sha],
-                        |_| Ok(()),
-                    )
-                    .is_ok()
-                {
+                // The embedding payload only needs to be written once per blob.
+                // Subsequent paths sharing this sha just get a files row.
+                if !cache.blob_payloads.contains_key(&sha) {
                     let lines: Vec<(u32, u32)> = chunks
                         .iter()
                         .map(|c| (c.start_line, c.end_line))
                         .collect();
                     let dim = embedder.dim();
                     let vec_slice = &flat_vecs[start * dim..(start + n) * dim];
-                    cache.insert_chunks(&sha, &lines, vec_slice, dim)?;
+                    cache.insert_chunks(&sha, &lines, vec_slice, dim);
                     stats.chunks_embedded += n;
                 }
-                cache.upsert_file(&path, &sha, mt, sz, chunks.len() as i64)?;
+                cache.upsert_file(&path, &sha, mt, sz, chunks.len() as i64);
                 stats.files_reembedded += 1;
             }
         }
@@ -341,9 +333,10 @@ pub fn index_repo(
         .collect();
     stats.files_gone = gone.len();
     if !gone.is_empty() {
-        cache.delete_files(&gone)?;
+        cache.delete_files(&gone);
     }
-    cache.prune_orphans()?;
+    // Orphan blob pruning happens inside commit() because that's where the
+    // referenced-set is materialized.
 
     let _ = owner; // silence unused
     stats.elapsed_ms = t0.elapsed().as_millis();

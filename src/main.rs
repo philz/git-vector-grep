@@ -1,19 +1,19 @@
 //! git-vector-grep: fast CPU vector grep over a git repo.
 
-mod cache;
 mod chunker;
 mod embedder;
 mod indexer;
 mod repo;
 mod search;
+mod store;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::cache::Cache;
 use crate::embedder::{AnyEmbedder, Embedder, RemoteEmbedder};
+use crate::store::Store;
 use crate::indexer::index_repo;
 use crate::repo::find_repo_root;
 use crate::search::Index;
@@ -91,10 +91,6 @@ enum Cmd {
     Clear {},
 }
 
-fn cache_path(root: &Path) -> PathBuf {
-    root.join(".git").join("vector-grep").join("index.sqlite")
-}
-
 fn build_embedder(cli: &Cli) -> Result<AnyEmbedder> {
     if cli.remote {
         Ok(AnyEmbedder::Remote(RemoteEmbedder::exe_gateway(
@@ -115,14 +111,15 @@ fn main() -> Result<()> {
         Cmd::Index { verbose, batch_size } => {
             let t0 = Instant::now();
             let mut emb = build_embedder(&cli)?;
-            let mut c = Cache::open(&cache_path(&root), emb.model_id(), emb.dim())?;
+            let mut s = Store::open(&root, emb.model_id(), emb.dim())?;
             if verbose {
                 eprintln!(
-                    "[index] repo={} model={} dim={}",
-                    root.display(), emb.model_id(), emb.dim()
+                    "[index] repo={} model={} dim={} ref={}",
+                    root.display(), emb.model_id(), emb.dim(), store::REF_NAME
                 );
             }
-            let stats = index_repo(&root, &mut c, &mut emb, batch_size, verbose)?;
+            let stats = index_repo(&root, &mut s, &mut emb, batch_size, verbose)?;
+            s.commit()?;
             eprintln!("[index] {}", stats);
             eprintln!("[index] wall: {:.2}s", t0.elapsed().as_secs_f64());
         }
@@ -141,17 +138,18 @@ fn main() -> Result<()> {
             anyhow::ensure!(!q.is_empty(), "query is empty");
 
             let mut emb = build_embedder(&cli)?;
-            let mut c = Cache::open(&cache_path(&root), emb.model_id(), emb.dim())?;
+            let mut s = Store::open(&root, emb.model_id(), emb.dim())?;
 
             if !no_auto_index {
-                let stats = index_repo(&root, &mut c, &mut emb, batch_size, verbose)?;
+                let stats = index_repo(&root, &mut s, &mut emb, batch_size, verbose)?;
                 if verbose {
                     eprintln!("[index] {}", stats);
                 }
+                s.commit()?;
             }
 
             let t_load = Instant::now();
-            let idx = Index::load(&c)?;
+            let idx = Index::load(&s)?;
             if verbose {
                 eprintln!(
                     "[search] loaded {} vectors in {:.3}s",
@@ -217,39 +215,46 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats {} => {
-            let cp = cache_path(&root);
             let (id, dim) = if cli.remote {
                 (cli.remote_model.as_str(), cli.remote_dim)
             } else {
                 let (_e, id, dim) = embedder::parse_model(&cli.model)?;
                 (id, dim)
             };
-            let c = Cache::open(&cp, id, dim).context("open cache")?;
-            let n_files: i64 = c
-                .conn
-                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-            let n_chunks: i64 = c
-                .conn
-                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-            let n_blobs: i64 = c.conn.query_row(
-                "SELECT COUNT(DISTINCT blob_sha) FROM chunks",
-                [],
-                |r| r.get(0),
-            )?;
-            let size = Cache::db_size(&cp);
-            println!("cache:    {}", cp.display());
+            let s = Store::open(&root, id, dim).context("open store")?;
+            let n_files = s.files.len();
+            let known = s.known_blob_shas()?;
+            let n_blobs = known.len();
+            // Sum chunks across all payloads in one batch.
+            let mut n_chunks: u64 = 0;
+            let blobs_size = {
+                let payloads = s.iter_all_payloads()?;
+                let mut total = 0u64;
+                for (_p, _sha, b) in &payloads {
+                    total += b.len() as u64;
+                    if let Some(n) = crate::store::peek_n(b) {
+                        n_chunks += n as u64;
+                    }
+                }
+                total
+            };
+            println!("ref:      {}", store::REF_NAME);
+            println!("model:    {}", id);
             println!("files:    {}", n_files);
             println!("chunks:   {}", n_chunks);
             println!("blobs:    {} unique", n_blobs);
-            println!("db size:  {:.1} MB", size as f64 / 1e6);
+            println!("payload:  {:.1} MB (uncompressed; git packs further)", blobs_size as f64 / 1e6);
         }
         Cmd::Clear {} => {
-            let cp = cache_path(&root);
-            for suffix in ["", "-wal", "-shm"] {
-                let p = PathBuf::from(format!("{}{}", cp.display(), suffix));
-                let _ = std::fs::remove_file(&p);
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["update-ref", "-d", store::REF_NAME])
+                .output()?;
+            if out.status.success() {
+                println!("deleted ref {}", store::REF_NAME);
+            } else {
+                eprintln!("git update-ref: {}", String::from_utf8_lossy(&out.stderr));
             }
-            println!("removed {}", cp.display());
         }
     }
     Ok(())

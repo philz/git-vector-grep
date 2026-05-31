@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::cache::Cache;
+use crate::store::{unpack_payload, Store};
 
 #[derive(Debug, Clone)]
 pub struct Hit {
@@ -25,33 +25,18 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn load(cache: &Cache) -> Result<Self> {
-        let mut stmt = cache.conn.prepare(
-            "SELECT f.path, c.blob_sha, c.idx, c.start_line, c.end_line, c.vec
-             FROM files f JOIN chunks c ON f.blob_sha = c.blob_sha
-             ORDER BY f.path, c.idx",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut meta = Vec::new();
+    pub fn load(store: &Store) -> Result<Self> {
+        let payloads = store.iter_all_payloads()?;
         let mut matrix: Vec<f32> = Vec::new();
-        let dim = cache.dim;
-        while let Some(r) = rows.next()? {
-            let path: String = r.get(0)?;
-            let sha: String = r.get(1)?;
-            let idx: i64 = r.get(2)?;
-            let s: i64 = r.get(3)?;
-            let e: i64 = r.get(4)?;
-            let v: Vec<u8> = r.get(5)?;
-            anyhow::ensure!(
-                v.len() == dim * 4,
-                "vec blob size {} != dim*4 {}",
-                v.len(),
-                dim * 4
-            );
-            // Decode little-endian f32 vector.
-            let floats: &[f32] = bytemuck::cast_slice(&v);
-            matrix.extend_from_slice(floats);
-            meta.push((path, sha, idx as u32, s as u32, e as u32));
+        let mut meta = Vec::new();
+        let mut dim = store.meta.dim;
+        for (path, sha, bytes) in payloads {
+            let (d, ranges, vecs) = unpack_payload(&bytes)?;
+            dim = d;
+            for (i, (s, e)) in ranges.iter().enumerate() {
+                matrix.extend_from_slice(&vecs[i * d..(i + 1) * d]);
+                meta.push((path.clone(), sha.clone(), i as u32, *s, *e));
+            }
         }
         Ok(Self { dim, matrix, meta })
     }

@@ -3,10 +3,29 @@
 A fast, cache-friendly **semantic grep** for any git repository. Single
 static-ish Rust binary; CPU-only; no GPU, no daemon, no external service.
 
-It indexes the current state of a git repo into a per-repo SQLite cache
-(`.git/vector-grep/index.sqlite`), embeds chunks with an ONNX text-embedding
+It indexes the current state of a git repo into a **hidden git ref**
+(`refs/vector-grep/index`), embeds chunks with an ONNX text-embedding
 model via [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), and
 performs cosine top-k search against an in-memory float32 matrix.
+
+No SQLite, no daemon, no scratch directory. The cache *is* a git tree:
+
+```
+refs/vector-grep/index
+├─ meta.json                 {"model_id":"...","dim":N,"schema":1}
+├─ files/<sha1(path)>.json   {"path":..., "blob_sha":..., "n_chunks":...}
+└─ blobs/<2hex>/<rest>.bin   packed f32 vectors, keyed by git blob SHA
+```
+
+Because the per-content payload is stored under git's blob SHA, you get:
+
+- **Free renames**: same content → same path under `blobs/`.
+- **Free dedup**: identical files share one payload, packed once.
+- **Free sharing**: `git push origin refs/vector-grep/index` ships embeddings
+  to teammates; they pay zero cold-index cost.
+- **Free GC**: `git gc` packs vectors with delta + zlib like any other blob.
+- **Free invalidation**: change models → bump the schema/model in `meta.json`
+  → the ref auto-rebuilds on the next run.
 
 ## Backend
 
