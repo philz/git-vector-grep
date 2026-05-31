@@ -106,12 +106,13 @@ impl Store {
                 return Ok(s);
             }
         }
-        // Load files/ manifest entries via `git ls-tree -r`.
+        // Load files/ manifest entries via `git ls-tree -r` + ONE batched
+        // `git cat-file --batch` for thousands of small JSON blobs.
         let out = run_git(repo, &["ls-tree", "-r", REF_NAME, "files/"])?;
         if !out.is_empty() {
+            let mut oids: Vec<String> = Vec::new();
             for line in std::str::from_utf8(&out)?.lines() {
-                // "100644 blob <sha>\tfiles/<2>/<rest>.json"
-                let (meta_part, path) = match line.split_once('\t') {
+                let (meta_part, _path) = match line.split_once('\t') {
                     Some(p) => p,
                     None => continue,
                 };
@@ -119,25 +120,22 @@ impl Store {
                 let _mode = it.next();
                 let kind = it.next();
                 let oid = it.next().unwrap_or("");
-                if kind != Some("blob") || oid.is_empty() {
-                    continue;
+                if kind == Some("blob") && !oid.is_empty() {
+                    oids.push(oid.to_string());
                 }
-                let bytes = match s.cat_blob(oid)? {
-                    Some(b) => b,
-                    None => continue,
-                };
-                #[derive(serde::Deserialize)]
-                struct OnDisk {
-                    path: String,
-                    blob_sha: String,
-                    mtime_ns: i64,
-                    size: i64,
-                    n_chunks: i64,
-                }
-                let od: OnDisk = match serde_json::from_slice(&bytes) {
-                    Ok(p) => p,
-                    Err(_) => { let _ = path; continue; }
-                };
+            }
+            #[derive(serde::Deserialize)]
+            struct OnDisk {
+                path: String,
+                blob_sha: String,
+                mtime_ns: i64,
+                size: i64,
+                n_chunks: i64,
+            }
+            let blobs = batch_cat_blobs(repo, oids)?;
+            for opt in blobs {
+                let Some(bytes) = opt else { continue };
+                let Ok(od) = serde_json::from_slice::<OnDisk>(&bytes) else { continue };
                 s.files.insert(od.path, FileRow {
                     blob_sha: od.blob_sha,
                     mtime_ns: od.mtime_ns,

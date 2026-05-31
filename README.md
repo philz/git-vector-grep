@@ -98,20 +98,33 @@ The cache **self-invalidates** if the model id or dim changes.
 - **Embeddings** are L2-normalized at write time so search is a plain dot
   product.
 
-## Benchmark (arcaneum, 272 files, 6646 chunks, **2-CPU VM**)
+## Benchmarks (2-CPU exe.dev VM, `--remote` backend)
+
+**arcaneum** (272 files, 6.6k chunks, ~14 MB payload):
 
 | Phase | Time |
 |---|---:|
-| Cold index | 6.2 min |
-| Incremental, clean tree | 0.2 s |
-| Rename one file | 0.2 s |
-| Modify one file | ~4 s |
-| Top-10 cosine scan | 0.5 ms |
-| Search end-to-end | 0.2 s |
+| Cold index | 6.0 s |
+| Incremental, clean tree | 0.25 s |
+| Rename | 0.22 s (32 chunks reused) |
+| Search end-to-end | 0.7 s |
 
-The cold-index number is dominated by the model's CPU inference
-throughput; on a 16-core dev laptop expect 30-60 s for the same workload.
-Everything else is unchanged because it's I/O- and SQLite-bound.
+**exe.git** (4319 files, 74k chunks, ~152 MB payload):
+
+| Phase | Time |
+|---|---:|
+| Cold index | 89 s |
+| Incremental, clean tree | 0.37 s |
+| Search end-to-end | 1.5 s |
+| Pack size added to `.git` | ~122 MB |
+
+With local ONNX inference (`--model minilm`), the cold-index phase is
+bottlenecked by CPU; on this 2-CPU VM expect ~10× longer. On a 16-core
+laptop the gap closes substantially.
+
+The in-memory cosine scan itself is ~5 ms over 74k vectors -- the rest of
+the "search end-to-end" wall time is `git cat-file --batch` streaming the
+vectors out of pack files.
 
 ## Inspiration
 
