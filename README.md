@@ -8,19 +8,20 @@ It indexes the current state of a git repo into a per-repo SQLite cache
 model via [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), and
 performs cosine top-k search against an in-memory float32 matrix.
 
-## Two backends
+## Backend
 
-- **Local (default)**: ONNX via `fastembed-rs`, default model
-  `sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, ~85 MB).
-  Override with `--model {minilm,bge-small,bge-base,jina-code,jina-en,...}`.
-- **Remote**: any OpenAI-compatible `/v1/embeddings` endpoint, with up to
-  `GVG_REMOTE_CONCURRENCY` parallel HTTP requests.
-  Default points at the exe.dev LLM gateway
-  (`https://llm.int.exe.xyz/v1`) using `openai/text-embedding-3-small`
-  truncated to 512-D via Matryoshka (`--remote-dim`). Enable with `--remote`.
+Local-only, ONNX via `fastembed-rs`. The default model is
+`sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, ~85 MB),
+chosen because (a) it's small enough to run on a 2-CPU laptop and (b) it
+still matches arcaneum's bge-class results on code identifier queries.
 
-On an exe.dev VM with only 2 CPUs, `--remote` is roughly **60× faster**
-than local CPU embedding on a cold index.
+Override with `--model {minilm,bge-small,bge-base,jina-code,jina-en,...}`.
+For real code search on a beefier machine, `--model jina-code` (jina-v2-base-code,
+768-D, code-specific training) is the recommended upgrade -- about 3×
+slower indexing but better semantic matches.
+
+An opt-in remote backend (`--remote`) exists for OpenAI-compatible
+`/v1/embeddings` endpoints, but is disabled by default.
 
 ## Why it's fast
 
@@ -78,16 +79,20 @@ The cache **self-invalidates** if the model id or dim changes.
 - **Embeddings** are L2-normalized at write time so search is a plain dot
   product.
 
-## Benchmark (arcaneum, 272 files, 6646 chunks, 2-CPU VM)
+## Benchmark (arcaneum, 272 files, 6646 chunks, **2-CPU VM**)
 
-| Phase | Local minilm | Remote text-embedding-3-small |
-|---|---:|---:|
-| Cold index | ~6 min | **7.7 s** |
-| Incremental, clean tree | 0.3 s | **0.017 s** |
-| Rename one file | 0.3 s | 0.02 s |
-| Modify one file | 3.8 s | 0.5 s |
-| Top-10 cosine scan | 0.5 ms | 0.5 ms |
-| Search end-to-end | ~300 ms | **~300 ms** |
+| Phase | Time |
+|---|---:|
+| Cold index | 6.2 min |
+| Incremental, clean tree | 0.2 s |
+| Rename one file | 0.2 s |
+| Modify one file | ~4 s |
+| Top-10 cosine scan | 0.5 ms |
+| Search end-to-end | 0.2 s |
+
+The cold-index number is dominated by the model's CPU inference
+throughput; on a 16-core dev laptop expect 30-60 s for the same workload.
+Everything else is unchanged because it's I/O- and SQLite-bound.
 
 ## Inspiration
 

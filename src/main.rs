@@ -59,7 +59,7 @@ enum Cmd {
     Index {
         #[arg(short, long)]
         verbose: bool,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 64)]
         batch_size: usize,
     },
     /// Search the repo. Will refresh the cache first unless --no-auto-index.
@@ -82,7 +82,7 @@ enum Cmd {
         json: bool,
         #[arg(short, long)]
         verbose: bool,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 64)]
         batch_size: usize,
     },
     /// Print cache stats.
