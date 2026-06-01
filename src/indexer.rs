@@ -85,8 +85,10 @@ pub fn index_repo(
         Unchanged,
         // (blob_sha, mtime_ns, size, n_chunks) -> upsert only
         ReuseBlob(String, i64, i64, i64),
-        // (chunks, vecs_placeholder) -> needs embedding; gathered after batching
-        Embed(String, Vec<Chunk>, i64, i64), // (blob_sha, chunks, mtime_ns, size)
+        // Needs embedding. We keep only the cheap line ranges here; the
+        // chunk text bytes live in `pending_texts` and get consumed (drained)
+        // during the embedding phase to free RAM.
+        Embed(String, Vec<(u32, u32)>, i64, i64), // (blob_sha, ranges, mtime_ns, size)
         Skip,
     }
 
@@ -180,6 +182,10 @@ pub fn index_repo(
 
     // Now classify and (lazily) read+chunk for Embed cases.
     let mut actions: Vec<(String, Action)> = Vec::with_capacity(loaded.len());
+    // sha -> chunk texts, populated as we plan. We DRAIN it during the
+    // embedding loop and free memory as we go.
+    let mut pending_texts: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     // Track new blob_shas we'll embed so dup content in this batch is shared.
     let mut planning_embed: HashSet<String> = HashSet::new();
 
@@ -240,63 +246,133 @@ pub fn index_repo(
             continue;
         }
         planning_embed.insert(ld.blob_sha.clone());
+        let ranges: Vec<(u32, u32)> = chunks.iter().map(|c| (c.start_line, c.end_line)).collect();
+        // Stash the texts in pending_texts; cheap line-ranges go into the
+        // action.
+        pending_texts.entry(ld.blob_sha.clone()).or_insert_with(|| {
+            chunks.into_iter().map(|c| c.text).collect()
+        });
         actions.push((
             ld.path.clone(),
-            Action::Embed(ld.blob_sha, chunks, ld.mtime_ns, ld.size),
+            Action::Embed(ld.blob_sha, ranges, ld.mtime_ns, ld.size),
         ));
     }
 
-    // 4. Run embeddings batched across all Embed entries, *deduplicated by
-    // blob_sha* so identical files only embed once even within one run.
+    // 4. Run embeddings batched across `pending_texts`, in bounded groups.
     use std::collections::HashMap;
-    let mut blob_to_chunks: HashMap<String, &Vec<Chunk>> = HashMap::new();
-    for (_p, a) in &actions {
-        if let Action::Embed(sha, chunks, _, _) = a {
-            blob_to_chunks.entry(sha.clone()).or_insert(chunks);
-        }
-    }
 
-    // Flatten into a single text vector for batched embedding.
-    let mut flat_texts: Vec<String> = Vec::new();
-    let mut owner: Vec<(String, u32, u32)> = Vec::new(); // (blob_sha, start, end)
-    // Preserve a stable order so we can slice back.
-    let mut blob_order: Vec<String> = blob_to_chunks.keys().cloned().collect();
+    // Plan the embedding work in BOUNDED GROUPS so peak memory stays small:
+    // process at most ~CHUNK_GROUP chunks at a time, embed them, stuff the
+    // resulting payloads into the cache, free the texts, repeat.
+    //
+    // This keeps fastembed/ORT from buffering 70k+ tokenized inputs at once
+    // (which OOMs an 8 GB box).
+    // Tighter group bound keeps peak memory low on tiny VMs.
+    // Override with GVG_CHUNK_GROUP env var if you have RAM to spare.
+    let chunk_group: usize = std::env::var("GVG_CHUNK_GROUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let dim = embedder.dim();
+
+    let mut blob_order: Vec<String> = pending_texts.keys().cloned().collect();
     blob_order.sort();
-    let mut blob_offsets: HashMap<String, (usize, usize)> = HashMap::new(); // sha -> (start, n)
-    for sha in &blob_order {
-        let chunks = blob_to_chunks.get(sha).unwrap();
-        let start = flat_texts.len();
-        for c in chunks.iter() {
-            flat_texts.push(c.text.clone());
-            owner.push((sha.clone(), c.start_line, c.end_line));
-        }
-        blob_offsets.insert(sha.clone(), (start, chunks.len()));
+    let total_chunks: usize = blob_order
+        .iter()
+        .map(|s| pending_texts.get(s).unwrap().len())
+        .sum();
+    if verbose && total_chunks > 0 {
+        eprintln!(
+            "[index] embedding {} chunks across {} unique blobs in groups of ≤{}...",
+            total_chunks,
+            blob_order.len(),
+            chunk_group,
+        );
     }
 
-    let mut flat_vecs: Vec<f32> = Vec::new();
-    if !flat_texts.is_empty() {
-        if verbose {
-            eprintln!(
-                "[index] embedding {} chunks across {} unique blobs...",
-                flat_texts.len(),
-                blob_order.len()
-            );
+    // For each blob, remember where its vectors landed (relative to the
+    // group's output buffer). We move blob_to_chunks's slices into the
+    // cache as we go.
+    let mut sha_to_vecs: HashMap<String, Vec<f32>> = HashMap::with_capacity(blob_order.len());
+
+    let mut group: Vec<(String, Vec<String>)> = Vec::new(); // (sha, chunk_texts)
+    let mut group_chunks: usize = 0;
+    let mut groups_done = 0usize;
+    let mut chunks_done = 0usize;
+
+    let mut flush = |group: &mut Vec<(String, Vec<String>)>,
+                     group_chunks: &mut usize,
+                     sha_to_vecs: &mut HashMap<String, Vec<f32>>,
+                     embedder: &mut AnyEmbedder|
+     -> Result<()> {
+        if group.is_empty() {
+            return Ok(());
         }
-        // Length-bucketed batching: sort by byte length so each ONNX batch has
-        // similar sequence lengths, minimizing padding. Then scatter vectors
-        // back to the original positions.
-        let n_flat = flat_texts.len();
-        let mut order: Vec<usize> = (0..n_flat).collect();
-        order.sort_by_key(|&i| flat_texts[i].len());
-        let sorted_texts: Vec<String> = order.iter().map(|&i| flat_texts[i].clone()).collect();
+        // Build flat text list and remember (sha, count) per entry.
+        let mut texts: Vec<String> = Vec::with_capacity(*group_chunks);
+        let mut counts: Vec<(String, usize)> = Vec::with_capacity(group.len());
+        for (sha, mut cs) in group.drain(..) {
+            let n = cs.len();
+            texts.append(&mut cs);
+            counts.push((sha, n));
+        }
+        // Length-bucket within the group only.
+        let n = texts.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| texts[i].len());
+        let sorted_texts: Vec<String> = order.iter().map(|&i| texts[i].clone()).collect();
         let sorted_vecs = embedder.embed_flat(sorted_texts, batch_size)?;
-        let dim = embedder.dim();
-        flat_vecs = vec![0f32; n_flat * dim];
-        for (sorted_pos, &orig_pos) in order.iter().enumerate() {
-            flat_vecs[orig_pos * dim..(orig_pos + 1) * dim]
-                .copy_from_slice(&sorted_vecs[sorted_pos * dim..(sorted_pos + 1) * dim]);
+        // Scatter back to original (group-local) positions.
+        let mut group_vecs = vec![0f32; n * dim];
+        for (sp, &op) in order.iter().enumerate() {
+            group_vecs[op * dim..(op + 1) * dim]
+                .copy_from_slice(&sorted_vecs[sp * dim..(sp + 1) * dim]);
+        }
+        // Split per blob and store.
+        let mut pos = 0usize;
+        for (sha, n_chunks) in counts {
+            let slice = group_vecs[pos * dim..(pos + n_chunks) * dim].to_vec();
+            sha_to_vecs.insert(sha, slice);
+            pos += n_chunks;
+        }
+        *group_chunks = 0;
+        Ok(())
+    };
+
+    for sha in &blob_order {
+        // Move texts out of pending_texts -- frees memory progressively.
+        let texts: Vec<String> = pending_texts.remove(sha).unwrap_or_default();
+        let n = texts.len();
+        // If adding this blob would blow the group budget AND the group has
+        // anything in it, flush first.
+        if group_chunks > 0 && group_chunks + n > chunk_group {
+            flush(&mut group, &mut group_chunks, &mut sha_to_vecs, embedder)?;
+            groups_done += 1;
+            chunks_done += group_chunks;
+            if verbose {
+                eprintln!(
+                    "[index] ... group {} done ({} chunks total)",
+                    groups_done, chunks_done
+                );
+            }
+        }
+        group_chunks += n;
+        group.push((sha.clone(), texts));
+        // If a single blob exceeds the budget, flush immediately.
+        if group_chunks >= chunk_group {
+            flush(&mut group, &mut group_chunks, &mut sha_to_vecs, embedder)?;
+            groups_done += 1;
+            chunks_done += group_chunks;
+            if verbose {
+                eprintln!(
+                    "[index] ... group {} done ({} chunks total)",
+                    groups_done, chunks_done
+                );
+            }
         }
     }
+    flush(&mut group, &mut group_chunks, &mut sha_to_vecs, embedder)?;
+    let _ = chunks_done;
 
     // 5. Apply: write embeddings and upsert file rows for all classified files.
     for (path, action) in actions {
@@ -305,21 +381,14 @@ pub fn index_repo(
             Action::ReuseBlob(sha, mt, sz, n) => {
                 cache.upsert_file(&path, &sha, mt, sz, n);
             }
-            Action::Embed(sha, chunks, mt, sz) => {
-                let (start, n) = blob_offsets[&sha];
-                // The embedding payload only needs to be written once per blob.
-                // Subsequent paths sharing this sha just get a files row.
+            Action::Embed(sha, ranges, mt, sz) => {
                 if !cache.blob_payloads.contains_key(&sha) {
-                    let lines: Vec<(u32, u32)> = chunks
-                        .iter()
-                        .map(|c| (c.start_line, c.end_line))
-                        .collect();
-                    let dim = embedder.dim();
-                    let vec_slice = &flat_vecs[start * dim..(start + n) * dim];
-                    cache.insert_chunks(&sha, &lines, vec_slice, dim);
-                    stats.chunks_embedded += n;
+                    if let Some(vec) = sha_to_vecs.remove(&sha) {
+                        cache.insert_chunks(&sha, &ranges, &vec, dim);
+                        stats.chunks_embedded += ranges.len();
+                    }
                 }
-                cache.upsert_file(&path, &sha, mt, sz, chunks.len() as i64);
+                cache.upsert_file(&path, &sha, mt, sz, ranges.len() as i64);
                 stats.files_reembedded += 1;
             }
         }
@@ -338,7 +407,6 @@ pub fn index_repo(
     // Orphan blob pruning happens inside commit() because that's where the
     // referenced-set is materialized.
 
-    let _ = owner; // silence unused
     stats.elapsed_ms = t0.elapsed().as_millis();
     Ok(stats)
 }

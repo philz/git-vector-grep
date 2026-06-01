@@ -98,33 +98,34 @@ The cache **self-invalidates** if the model id or dim changes.
 - **Embeddings** are L2-normalized at write time so search is a plain dot
   product.
 
-## Benchmarks (2-CPU exe.dev VM, `--remote` backend)
+## Benchmarks (local ONNX, MiniLM-L6-v2, 2-CPU exe.dev VM)
 
-**arcaneum** (272 files, 6.6k chunks, ~14 MB payload):
-
-| Phase | Time |
-|---|---:|
-| Cold index | 6.0 s |
-| Incremental, clean tree | 0.25 s |
-| Rename | 0.22 s (32 chunks reused) |
-| Search end-to-end | 0.7 s |
-
-**exe.git** (4319 files, 74k chunks, ~152 MB payload):
+**arcaneum** (272 files, 6.6k chunks):
 
 | Phase | Time |
 |---|---:|
-| Cold index | 89 s |
-| Incremental, clean tree | 0.37 s |
-| Search end-to-end | 1.5 s |
-| Pack size added to `.git` | ~122 MB |
+| Cold index | 6 min 12 s |
+| Incremental, clean tree | 0.2 s |
+| Rename | 0.2 s (32 chunks reused) |
+| Search end-to-end | 0.2 s |
 
-With local ONNX inference (`--model minilm`), the cold-index phase is
-bottlenecked by CPU; on this 2-CPU VM expect ~10× longer. On a 16-core
-laptop the gap closes substantially.
+**exe.git** (4319 files, 74k chunks, 4223 unique blobs):
 
-The in-memory cosine scan itself is ~5 ms over 74k vectors -- the rest of
-the "search end-to-end" wall time is `git cat-file --batch` streaming the
-vectors out of pack files.
+| Phase | Time |
+|---|---:|
+| Cold index | **65 min** |
+| Peak RSS during index | **~2.5 GB** |
+| Incremental, clean tree | 0.6 s |
+| Search end-to-end | 1.2 s (1.0 s loading vectors, 8 ms scan) |
+| Pack size added to `.git` | ~114 MB |
+
+Cold-index is entirely CPU-bound on this 2-CPU VM; the user-time is ~12 min
+which scales near-linearly with cores. On a 16-core laptop expect ~8 min.
+
+Memory is bounded by `GVG_CHUNK_GROUP` (default 512 chunks). The whole
+repo's chunks are processed in groups; each group is length-bucketed for
+padding efficiency, embedded, written, and freed before the next group
+starts. Lower the value if you OOM, raise it if you have spare RAM.
 
 ## Inspiration
 
