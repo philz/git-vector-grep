@@ -1,147 +1,121 @@
 # git-vector-grep
 
-A fast, cache-friendly **semantic grep** for any git repository. Single
-static-ish Rust binary; CPU-only; no GPU, no daemon, no external service.
+Semantic grep over a git repo. Single Rust binary; CPU-only; no daemon, no
+sidecar database, no external service. The embedding cache lives inside
+your repo as a **git notes ref**, so it ships over `git push` and dedups
+across branches, renames, and machines for free.
 
-It indexes the current state of a git repo into a **hidden git ref**
-(`refs/vector-grep/index`), embeds chunks with an ONNX text-embedding
-model via [`fastembed-rs`](https://github.com/Anush008/fastembed-rs), and
-performs cosine top-k search against an in-memory float32 matrix.
+> ⚠️ **Caveat emptor: this is vibe-coded.** Built end-to-end in a few
+> sessions with an LLM driving. It works on the repos I've thrown at it
+> (a 4.2k-file Go codebase, a 280-file Python one) but it is not battle
+> tested. Read the source before pointing it at anything precious.
 
-No SQLite, no daemon, no scratch directory. The cache *is* a git tree:
+## What it does
 
 ```
-refs/vector-grep/index
-├─ meta.json                 {"model_id":"...","dim":N,"schema":1}
-├─ files/<sha1(path)>.json   {"path":..., "blob_sha":..., "n_chunks":...}
-└─ blobs/<2hex>/<rest>.bin   packed f32 vectors, keyed by git blob SHA
+$ git-vector-grep index                   # one-time, incremental thereafter
+$ git-vector-grep search "how do we chunk PDFs" -k 5
+0.6122  src/arcaneum/indexing/pdf/chunker.py:49-68
+0.6061  docs/rdr/RDR-014-markdown-indexing.md:129-148
+...
 ```
 
-Because the per-content payload is stored under git's blob SHA, you get:
+## Where the cache lives
 
-- **Free renames**: same content → same path under `blobs/`.
-- **Free dedup**: identical files share one payload, packed once.
-- **Free sharing**: `git push origin refs/vector-grep/index` ships embeddings
-  to teammates; they pay zero cold-index cost.
-- **Free GC**: `git gc` packs vectors with delta + zlib like any other blob.
-- **Free invalidation**: change models → bump the schema/model in `meta.json`
-  → the ref auto-rebuilds on the next run.
+Under `refs/notes/vector-grep/<model-short-id>`, with the standard
+git-notes 2/38 fanout tree:
 
-## Backend
+```
+refs/notes/vector-grep/minilm
+├── 73/3d936e948d3d022e94ee4c2172e15fd83e934d    ← payload, attached to
+├── fc/7d1ab1d12d9a8fbb5d29a911d2cc47ac385b23       source blob SHA
+└── ...                                              (one note per blob)
+```
 
-Local-only, ONNX via `fastembed-rs`. The default model is
-`sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, 6 transformer
-layers, ~85 MB on disk). 6 layers turned out to win on CPU even against
-static-INT8 `BGESmallENV15Q` on Zen 4: fewer layers > VNNI uplift.
+Each note is a packed binary: `VGRP` magic, dim, n_chunks, line ranges,
+f32 vectors. The cache key for a payload is **git's own blob SHA1** of
+the source file — git already computed it; we just look it up via
+`git ls-files -s`.
 
-Override with `--model {minilm,bge-small,bge-small-q,bge-base,jina-code}`.
+Consequences:
 
-## CPU parallelism
+- **Renames are free.** Same content → same SHA → cache hit.
+- **Dedup is free.** Two identical files share one note.
+- **Branch switches are free.** Indexing a feature branch off main only
+  embeds the blobs unique to the branch.
+- **Sharing is free.** `git push` ships the cache; `git pull` receives it.
+- **Inspectable with stock git.** `git notes --ref=refs/notes/vector-grep/minilm list` etc.
+- **Mergeable with stock git.** `git notes merge --strategy=union` resolves
+  the two-clients-pushing-disjoint-blobs case with zero custom code,
+  because embeddings are deterministic per `(model, blob_sha)`.
+- **Multi-model coexistence.** Each model gets its own notes ref. Index
+  with two models and they live side by side.
 
-For tiny transformer encoders, one ORT session with `intra_threads=8`
-scales sub-linearly past ~2 threads. We instead spawn **one ORT session
-per worker thread, each pinned to `intra_threads=1`**, and shard work
-across workers with rayon. On an 8-core box this is roughly 3-4× the
-throughput of the single-session approach.
+## Usage
 
-Worker count defaults to roughly `min(cpus, (RAM_GB - 1.5) / 0.75)` --
-model weights and activation arenas grow per session. Override with
-`--workers N`. Lower `--batch-size` if you OOM (default 16).
+```
+git-vector-grep index                        # incremental reindex
+git-vector-grep search QUERY -k 10           # top-k cosine search
+git-vector-grep search QUERY --show          # with snippet text
+git-vector-grep search QUERY --path src/     # restrict by prefix
+git-vector-grep stats                        # what's cached
 
-## Why it's fast
+git-vector-grep config-remote --remote origin   # one-time setup
+git-vector-grep push --remote origin            # share cache
+git-vector-grep pull --remote origin            # receive cache
 
-- **The cache key is the git blob SHA** that `git ls-files -s` already prints.
-  For an unmodified working tree, indexing reads zero file bytes and computes
-  zero hashes -- it's basically just SQLite lookups.
-- For modified files we recompute the SHA-1 ourselves (it matches what git
-  would compute), and **renames + duplicate-content files reuse embeddings
-  for free** because the cache is keyed by content, not path.
-- The embedding model is downloaded once into `~/.cache/git-vector-grep/`
-  and reloaded from disk on each call.
-- Top-k cosine is a NumPy-style dense scan parallelized with `rayon`; at
-  ~3.4k chunks of dim 384 it returns top-10 in **~0.5 ms**.
+git-vector-grep gc                              # collapse cache history
+git-vector-grep clear                           # drop current model's cache
+```
+
+Global flags:
+
+- `--model {minilm,bge-small,bge-small-q,bge-base,jina-code}` — default
+  `minilm` (`sentence-transformers/all-MiniLM-L6-v2`, 384-D, ~85 MB ONNX).
+- `--workers N` — parallel ONNX sessions (default: auto-sized by RAM).
+- `--repo PATH` — operate on a repo other than `$PWD`.
+
+First run of a given model downloads the ONNX weights from HuggingFace
+into `~/.cache/git-vector-grep/models/`.
 
 ## Build
 
+Rust 1.75+:
+
 ```
 cargo build --release
+# -> ./target/release/git-vector-grep (~28 MB; bundles ONNX Runtime)
 ```
 
-The resulting `target/release/git-vector-grep` is a single binary with
-ONNX Runtime statically linked.
+Prebuilt Linux x86_64 binaries are attached to each GitHub release.
 
-## Use
+## Performance
 
-```
-git-vector-grep index               # bring the cache up to date
-git-vector-grep search QUERY...     # auto-reindexes, then searches
-git-vector-grep search --no-auto-index QUERY...
-git-vector-grep stats
-git-vector-grep clear
-```
+8-CPU / 8 GB Zen 4 VM, MiniLM, CPU only:
 
-Flags:
+|                           | files | chunks | cold index | incremental | search |
+|---------------------------|-------|--------|-----------:|------------:|-------:|
+| arcaneum (Python)         |   280 |  6 701 |   2m 20s   |    0.3s     |  0.2s  |
+| exe (Go)                  | 4 262 | 69 373 |  26m 36s   |    1.1s     |  1.6s  |
 
-- `--model` -- `bge-small` (default), `bge-base`, `jina-code`, `jina-en`,
-  `minilm`, `minilm-q`, `bge-small-q`.
-- `--threads N` -- ONNX intra-op threads (defaults to all cores).
-- `--path PREFIX` -- restrict matches to a subtree.
-- `-k N` -- top-k (default 10).
-- `--show` -- print the matching chunk text.
-- `--json` -- machine-readable output.
+Incremental reindex on a clean repo is dominated by `git ls-files`.
+Search is dominated by streaming the vector matrix out of pack via
+`git cat-file --batch` (~1.0s of the 1.6s on exe.git); that's the next
+thing to fix, see `NEXT_STEPS.md`.
 
-The cache **self-invalidates** if the model id or dim changes.
+## Design choices the code is opinionated about
 
-## Design notes
+- **No daemon.** Each invocation is short-lived.
+- **No SQLite, no sidecar files.** Everything lives in git objects.
+- **No network at runtime.** All embedding is local via bundled ONNX
+  Runtime. The only network call is the one-time model download from
+  HuggingFace on first use of each model.
+- **No path table.** Paths come from `git ls-files -s` on every search
+  (~14 ms on a 5k-file repo). The cache only stores `(blob_sha → vectors)`.
+- **Stock git everything.** push/pull are `git push`/`git fetch`; gc is
+  collapse-then-`git gc`; merge is `git notes merge --strategy=union`.
+  We're a thin layer over git's existing notes machinery.
 
-- **Chunker**: 40-line windows, 8-line overlap, max 4 KB / chunk. Plain text;
-  binary and oversized files are skipped. No tree-sitter (keeps the binary
-  small); the chunker is the obvious upgrade path for code-aware splitting.
-- **Schema**: `files(path PK, blob_sha, mtime_ns, size, n_chunks)` and
-  `chunks(blob_sha, idx, start_line, end_line, vec BLOB)` with PK
-  `(blob_sha, idx)`. Storing vectors under the blob SHA decouples them from
-  paths, which is what makes rename detection free.
-- **Embeddings** are L2-normalized at write time so search is a plain dot
-  product.
+## License
 
-## Benchmarks (local ONNX, MiniLM-L6-v2)
-
-**arcaneum** (272 files, 6.6k chunks):
-
-| Phase | 2 CPUs | 8 CPUs (Zen 4) |
-|---|---:|---:|
-| Cold index | 6 min 12 s | **2 min 20 s** (~2.7×) |
-| Incremental | 0.2 s | 0.2 s |
-| Search | 0.2 s | 0.2 s |
-
-**exe.git** (4262 textual files, 69k unique chunks, 4169 unique blobs):
-
-| Phase | 2 CPUs | 8 CPUs (Zen 4) |
-|---|---:|---:|
-| Cold index | 65 min | **26 min 36 s** (~2.5×) |
-| Peak RSS during index | 2.5 GB | 5.7 GB |
-| Incremental, clean tree | 0.6 s | 1.1 s |
-| Search end-to-end | 1.2 s | 1.7 s |
-| Pack size added to `.git` | ~114 MB | ~114 MB |
-
-Cold-index speedup is sub-linear vs. CPU count because each ORT session
-has its own model weights + activation arena; you can't run as many
-workers in parallel as you have cores without OOMing. The current sweet
-spot on the 8 GB / 8-CPU box is **8 workers × batch_size=8**.
-
-The ~1 s of "search end-to-end" is dominated by streaming vectors out of
-the pack via `git cat-file --batch`; the in-memory dot-product over 73k
-vectors is ~3 ms.
-
-## Inspiration
-
-Model choice and overall pipeline ideas borrowed from
-[arcaneum](https://github.com/cwensel/arcaneum), which surveys current
-code-embedding models thoughtfully. Differences:
-
-- arcaneum uses Qdrant; we use SQLite (single binary, no daemon).
-- arcaneum's code cache is at *commit* granularity; ours is at *content*
-  granularity, which is much better for interactive use as the working tree
-  changes.
-- arcaneum reads files to hash them; we lean on `git ls-files -s` so an
-  unchanged repo costs zero file I/O.
+MIT OR Apache-2.0.
