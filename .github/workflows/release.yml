@@ -1,23 +1,60 @@
-name: release
+name: Release
 
 on:
+  workflow_run:
+    workflows: ["Test"]
+    branches: [main]
+    types: [completed]
+  # Also build/release on explicit tags or manual dispatch.
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  tag:
+    # Only auto-tag main after a green Test run. Manual dispatches and
+    # direct tag pushes skip this and go straight to build.
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: generate version tag
+        id: version
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          SHORT_SHA=$(git rev-parse --short=6 HEAD)
+          # Prefix the octal-encoded SHA with 9 so it sorts as a valid semver pre-release component.
+          SHA_OCTAL=$(printf '%o' "0x${SHORT_SHA}")
+          VERSION="0.${COUNT}.9${SHA_OCTAL}"
+          TAG="v${VERSION}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG} (${SHORT_SHA})"
+          git push origin "${TAG}"
+
   build-linux:
     name: build linux-x86_64
     runs-on: ubuntu-latest
+    # Run on tag pushes and manual dispatch directly. After auto-tag, the
+    # newly-pushed tag fires a separate workflow run that picks this up.
+    if: github.event_name != 'workflow_run'
     steps:
       - uses: actions/checkout@v4
 
-      - name: install rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: build (musl static)
         run: |
@@ -39,11 +76,8 @@ jobs:
           tar -C dist -czf dist/$OUT.tar.gz $OUT
           (cd dist && sha256sum $OUT.tar.gz > $OUT.tar.gz.sha256)
           ls -la dist/
-          echo "asset=dist/$OUT.tar.gz" >> $GITHUB_OUTPUT
-          echo "sha=dist/$OUT.tar.gz.sha256" >> $GITHUB_OUTPUT
 
-      - name: upload artifact (always)
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
           path: dist/*
