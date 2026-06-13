@@ -4,16 +4,16 @@
 //!
 //!   meta.json                    {"model_id":"...","dim":N,"schema":1}
 //!   blobs/<2hex>/<rest>.bin      content-addressed payload
-//!   files/<2hex>/<rest>.json     manifest: which paths map to which blob_sha
 //!
 //! The `blobs/<sha>.bin` file is the cache *value* for a given git blob SHA
 //! (which we already use as the cache key). Storing it under that SHA gives
-//! us free renames, free branch-switches, and `git gc` packs everything.
+//! us free renames, free branch-switches, dedup of identical files, and
+//! `git gc` packs everything.
 //!
-//! `files/` records the (path -> blob_sha, mtime_ns, size, n_chunks) mapping
-//! so we can decide what to (re-)embed without reading file bytes. It's one
-//! small JSON file per source path; we batch them in a single fast-import
-//! stream.
+//! There is intentionally NO `files/` manifest. The mapping from path to
+//! blob SHA lives in git's own index (`git ls-files -s`) and is rebuilt on
+//! every invocation in ~14 ms; storing it twice would only cause
+//! branch-switch churn.
 //!
 //! Each `<sha>.bin` payload is:
 //!
@@ -26,12 +26,12 @@
 //!
 //! Writes go through `git fast-import`; reads through `git cat-file --batch`.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use bytemuck::{cast_slice, cast_slice_mut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 pub const REF_NAME: &str = "refs/vector-grep/index";
 pub const SCHEMA: u16 = 1;
@@ -43,30 +43,28 @@ pub struct Meta {
     pub schema: u16,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileRow {
-    pub blob_sha: String,
-    pub mtime_ns: i64,
-    pub size: i64,
-    pub n_chunks: i64,
-}
-
-/// In-memory representation of the entire embedding ref. Loaded once per
-/// invocation; we materialize a new tree at the end if anything changed.
+/// In-memory representation of the embedding ref. We load whichever payloads
+/// the caller asks for and buffer any new payloads to write, then materialize
+/// a new tree in `commit()`.
 pub struct Store {
     pub repo: PathBuf,
     pub meta: Meta,
-    /// path -> FileRow (loaded from `files/`)
-    pub files: HashMap<String, FileRow>,
-    /// blob_sha -> payload bytes (loaded lazily on demand via load_payload).
-    /// We only populate this for blobs we actually need.
+    /// Cached in-memory copies of payloads we've already fetched (lazy).
     payload_cache: HashMap<String, Vec<u8>>,
-    /// For materializing the new tree at write time, we need to know each
-    /// path entry's existing git oid so we can keep unchanged entries cheaply.
-    /// (Optimization left for later; first pass rewrites the whole tree.)
+    /// New payloads produced this run (keyed by blob_sha). Written to git
+    /// at commit time and shadow these out of the on-disk view.
     pub blob_payloads: HashMap<String, Vec<u8>>,
-    /// True if anything mutated (files/, blobs/, meta).
+    /// Blob SHAs that should survive the next `commit()`. Anything in the
+    /// existing tree that isn't in here is pruned as an orphan. Defaults to
+    /// "keep everything" (caller didn't set it) so callers that only want
+    /// to read can't accidentally truncate the cache.
+    referenced: Option<HashSet<String>>,
+    /// True if anything mutated (meta replaced, payloads added, or
+    /// referenced-set explicitly changed the on-disk view).
     pub dirty: bool,
+    /// True if the existing ref was found with a different model/dim. The
+    /// next commit will drop every existing blob.
+    stale: bool,
 }
 
 impl Store {
@@ -80,82 +78,41 @@ impl Store {
                 dim,
                 schema: SCHEMA,
             },
-            files: HashMap::new(),
             payload_cache: HashMap::new(),
             blob_payloads: HashMap::new(),
+            referenced: None,
             dirty: false,
+            stale: false,
         };
-        // Resolve the ref. If it doesn't exist, we're done.
         let head = s.rev_parse(REF_NAME)?;
         let Some(_head_sha) = head else {
             return Ok(s);
         };
-        // Check meta.
         match s.cat_blob(&format!("{}:meta.json", REF_NAME))? {
             Some(bytes) => {
                 let m: Meta = serde_json::from_slice(&bytes)
                     .context("parsing meta.json from ref")?;
                 if m.model_id != model_id || m.dim != dim || m.schema != SCHEMA {
-                    // Stale ref. Treat as empty; caller will rewrite.
+                    s.stale = true;
                     s.dirty = true;
-                    return Ok(s);
                 }
             }
             None => {
+                s.stale = true;
                 s.dirty = true;
-                return Ok(s);
-            }
-        }
-        // Load files/ manifest entries via `git ls-tree -r` + ONE batched
-        // `git cat-file --batch` for thousands of small JSON blobs.
-        let out = run_git(repo, &["ls-tree", "-r", REF_NAME, "files/"])?;
-        if !out.is_empty() {
-            let mut oids: Vec<String> = Vec::new();
-            for line in std::str::from_utf8(&out)?.lines() {
-                let (meta_part, _path) = match line.split_once('\t') {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let mut it = meta_part.split_whitespace();
-                let _mode = it.next();
-                let kind = it.next();
-                let oid = it.next().unwrap_or("");
-                if kind == Some("blob") && !oid.is_empty() {
-                    oids.push(oid.to_string());
-                }
-            }
-            #[derive(serde::Deserialize)]
-            struct OnDisk {
-                path: String,
-                blob_sha: String,
-                mtime_ns: i64,
-                size: i64,
-                n_chunks: i64,
-            }
-            let blobs = batch_cat_blobs(repo, oids)?;
-            for opt in blobs {
-                let Some(bytes) = opt else { continue };
-                let Ok(od) = serde_json::from_slice::<OnDisk>(&bytes) else { continue };
-                s.files.insert(od.path, FileRow {
-                    blob_sha: od.blob_sha,
-                    mtime_ns: od.mtime_ns,
-                    size: od.size,
-                    n_chunks: od.n_chunks,
-                });
             }
         }
         Ok(s)
     }
 
-    /// `path` -> FileRow, like `Cache::load_files`.
-    pub fn load_files(&self) -> &HashMap<String, FileRow> {
-        &self.files
-    }
-
-    /// All `blob_sha` values currently stored in `blobs/`.
-    pub fn known_blob_shas(&self) -> Result<std::collections::HashSet<String>> {
+    /// All `blob_sha` values currently stored in `blobs/` on the ref.
+    /// Returns an empty set if the ref was opened with a stale meta.
+    pub fn known_blob_shas(&self) -> Result<HashSet<String>> {
+        if self.stale {
+            return Ok(HashSet::new());
+        }
         let out = run_git(&self.repo, &["ls-tree", "-r", REF_NAME, "blobs/"])?;
-        let mut set = std::collections::HashSet::new();
+        let mut set = HashSet::new();
         if out.is_empty() {
             return Ok(set);
         }
@@ -164,22 +121,24 @@ impl Store {
                 Some(p) => p,
                 None => continue,
             };
-            // blobs/<2hex>/<rest>.bin
-            if !path.ends_with(".bin") {
-                continue;
+            if let Some(sha) = sha_from_blob_path(path) {
+                set.insert(sha);
             }
-            let rest = path.strip_prefix("blobs/").unwrap_or(path);
-            let rest = rest.trim_end_matches(".bin");
-            let sha = rest.replacen('/', "", 1);
-            set.insert(sha);
         }
         Ok(set)
     }
 
     /// Load the payload for a given blob_sha as raw bytes (cached in memory).
+    /// Looks in the pending-writes buffer first, then on the ref.
     pub fn load_payload(&mut self, blob_sha: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(b) = self.blob_payloads.get(blob_sha) {
+            return Ok(Some(b.clone()));
+        }
         if let Some(b) = self.payload_cache.get(blob_sha) {
             return Ok(Some(b.clone()));
+        }
+        if self.stale {
+            return Ok(None);
         }
         let p = format!("{}:blobs/{}/{}.bin", REF_NAME, &blob_sha[..2], &blob_sha[2..]);
         match self.cat_blob(&p)? {
@@ -191,76 +150,26 @@ impl Store {
         }
     }
 
-    /// Iterate over every (path, payload_bytes) currently in the store, in
-    /// stable order. Used by the in-memory index loader.
-    pub fn iter_all_payloads(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
-        // First: get (path -> blob_sha) for every file row, stably ordered.
-        let mut entries: Vec<(String, String)> = self
-            .files
+    /// Stream every (blob_sha, payload_bytes) currently in the store, in
+    /// blob_sha order. Pulls everything via a single `git cat-file --batch`.
+    pub fn iter_all_payloads(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut shas: Vec<String> = self.known_blob_shas()?.into_iter().collect();
+        shas.sort();
+        let specs: Vec<String> = shas
             .iter()
-            .map(|(p, r)| (p.clone(), r.blob_sha.clone()))
+            .map(|s| format!("{}:blobs/{}/{}.bin", REF_NAME, &s[..2], &s[2..]))
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Unique blob shas in stable order.
-        let mut wanted: Vec<String> = entries.iter().map(|(_, s)| s.clone()).collect();
-        wanted.sort();
-        wanted.dedup();
-
-        // Batch-fetch via one `git cat-file --batch` invocation.
-        let cat = batch_cat_blobs(
-            &self.repo,
-            wanted.iter().map(|s| {
-                format!("{}:blobs/{}/{}.bin", REF_NAME, &s[..2], &s[2..])
-            }).collect(),
-        )?;
-        let mut sha_to_payload: HashMap<String, Vec<u8>> = HashMap::new();
-        for (sha, bytes) in wanted.into_iter().zip(cat) {
+        let cat = batch_cat_blobs(&self.repo, specs)?;
+        let mut out = Vec::with_capacity(shas.len());
+        for (sha, bytes) in shas.into_iter().zip(cat) {
             if let Some(b) = bytes {
-                sha_to_payload.insert(sha, b);
-            }
-        }
-
-        // Re-emit per path.
-        let mut out = Vec::with_capacity(entries.len());
-        for (path, sha) in entries {
-            if let Some(b) = sha_to_payload.get(&sha) {
-                out.push((path, sha, b.clone()));
+                out.push((sha, b));
             }
         }
         Ok(out)
     }
 
-    /// Mutators -- buffered in memory; flushed by `commit()`.
-    pub fn upsert_file(
-        &mut self,
-        path: &str,
-        blob_sha: &str,
-        mtime_ns: i64,
-        size: i64,
-        n_chunks: i64,
-    ) {
-        self.files.insert(
-            path.to_string(),
-            FileRow {
-                blob_sha: blob_sha.to_string(),
-                mtime_ns,
-                size,
-                n_chunks,
-            },
-        );
-        self.dirty = true;
-    }
-
-    pub fn delete_files(&mut self, paths: &[String]) {
-        for p in paths {
-            self.files.remove(p);
-        }
-        if !paths.is_empty() {
-            self.dirty = true;
-        }
-    }
-
+    /// Buffer a payload to be written on the next commit.
     pub fn insert_chunks(
         &mut self,
         blob_sha: &str,
@@ -270,6 +179,15 @@ impl Store {
     ) {
         let payload = pack_payload(dim, ranges, vecs);
         self.blob_payloads.insert(blob_sha.to_string(), payload);
+        self.dirty = true;
+    }
+
+    /// Set the *exact* set of blob SHAs that should be present after the
+    /// next commit. Anything in the existing tree not in this set is
+    /// pruned. The caller MUST include shas that are still in use on disk
+    /// but were neither re-embedded nor reused this run.
+    pub fn set_referenced(&mut self, set: HashSet<String>) {
+        self.referenced = Some(set);
         self.dirty = true;
     }
 
@@ -283,12 +201,16 @@ impl Store {
         }
     }
 
-    /// Materialize a new tree containing meta.json + files/ + blobs/ and
-    /// update the ref. Uses a single `git fast-import` subprocess.
+    /// Materialize a new tree containing meta.json + blobs/ and update the
+    /// ref. The new commit is a child of the previous tip (linear history).
     pub fn commit(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
+        // Resolve the previous tip before we start (so fast-import's `from`
+        // can chain onto it).
+        let parent = if !self.stale { self.rev_parse(REF_NAME)? } else { None };
+
         let mut fi = Command::new("git")
             .arg("-C")
             .arg(&self.repo)
@@ -299,57 +221,37 @@ impl Store {
             .context("spawn git fast-import")?;
         let stdin = fi.stdin.as_mut().unwrap();
 
-        // Mark allocator. fast-import requires :N where N is a positive integer.
         let mut next_mark: u32 = 0;
-        let mut mk = || { next_mark += 1; format!(":{}", next_mark) };
-        // Blob: meta.json
+        let mut mk = || {
+            next_mark += 1;
+            format!(":{}", next_mark)
+        };
         let meta_bytes = serde_json::to_vec(&self.meta)?;
         let meta_mark = mk();
         write_blob_with_mark(stdin, &meta_mark, &meta_bytes)?;
 
-        // Blob: every files/<path-hash>.json
-        let mut file_entries: Vec<(String, String)> = Vec::with_capacity(self.files.len());
-        for (path, row) in &self.files {
-            #[derive(serde::Serialize)]
-            struct OnDisk<'a> {
-                path: &'a str,
-                #[serde(flatten)]
-                row: &'a FileRow,
-            }
-            let json = serde_json::to_vec(&OnDisk { path, row })?;
-            let mark = mk();
-            write_blob_with_mark(stdin, &mark, &json)?;
-            file_entries.push((path_to_files_subpath(path), mark));
-        }
+        // Decide which existing blobs to carry over. If the caller didn't
+        // set a referenced-set, keep everything that's already there (safe
+        // for read-only/refresh runs).
+        let existing_blob_paths = if self.stale {
+            Vec::new()
+        } else {
+            self.existing_blob_tree_paths()?
+        };
+        let wrote_shas: HashSet<String> = self.blob_payloads.keys().cloned().collect();
 
-        // Blob: every blobs/<sha>.bin
-        // We need to keep blobs that exist on the ref but for which we don't
-        // have an in-memory payload (untouched this run). Fetch their oids
-        // from the existing tree.
-        let existing_blob_paths = self.existing_blob_tree_paths()?;
         let mut blob_entries: Vec<(String, BlobSource)> = Vec::new();
-        let mut wrote_shas = std::collections::HashSet::new();
         for (sha, bytes) in &self.blob_payloads {
             let mark = mk();
             write_blob_with_mark(stdin, &mark, bytes)?;
             blob_entries.push((blob_subpath(sha), BlobSource::Mark(mark)));
-            wrote_shas.insert(sha.clone());
         }
-        // Carry over existing blobs we didn't touch, but only for shas that
-        // are still referenced by at least one file row (orphan pruning).
-        let referenced: std::collections::HashSet<String> = self
-            .files
-            .values()
-            .map(|r| r.blob_sha.clone())
-            .collect();
         for (path, oid) in existing_blob_paths {
-            // path like "blobs/aa/bb...bin"
-            let sha = sha_from_blob_path(&path).unwrap_or_default();
-            if sha.is_empty() {
-                continue;
-            }
-            if !referenced.contains(&sha) {
-                continue; // prune orphan
+            let Some(sha) = sha_from_blob_path(&path) else { continue };
+            if let Some(ref ref_set) = self.referenced {
+                if !ref_set.contains(&sha) {
+                    continue;
+                }
             }
             if wrote_shas.contains(&sha) {
                 continue; // overwritten this run
@@ -357,7 +259,6 @@ impl Store {
             blob_entries.push((path, BlobSource::Oid(oid)));
         }
 
-        // Commit: write a commit pointing to a new tree.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -366,13 +267,13 @@ impl Store {
         let msg = b"git-vector-grep snapshot\n";
         writeln!(stdin, "data {}", msg.len())?;
         stdin.write_all(msg)?;
-        // No `from` -- replace the ref's history entirely each commit. The
-        // tree dedupes against pack objects, so this is cheap.
+        // Chain onto the previous tip (linear history) so `git push` is a
+        // fast-forward. If there's no previous tip, the new commit is a root.
+        if let Some(p) = parent {
+            writeln!(stdin, "from {}", p)?;
+        }
         writeln!(stdin, "deleteall")?;
         writeln!(stdin, "M 100644 {} meta.json", meta_mark)?;
-        for (path, mark) in &file_entries {
-            writeln!(stdin, "M 100644 {} {}", mark, path)?;
-        }
         for (path, src) in &blob_entries {
             match src {
                 BlobSource::Mark(m) => writeln!(stdin, "M 100644 {} {}", m, path)?,
@@ -389,11 +290,11 @@ impl Store {
             );
         }
         self.dirty = false;
+        self.stale = false;
         Ok(())
     }
 
     fn existing_blob_tree_paths(&self) -> Result<Vec<(String, String)>> {
-        // (path, oid) for every existing blobs/* entry.
         let head = self.rev_parse(REF_NAME)?;
         if head.is_none() {
             return Ok(Vec::new());
@@ -416,7 +317,7 @@ impl Store {
         Ok(v)
     }
 
-    fn rev_parse(&self, name: &str) -> Result<Option<String>> {
+    pub fn rev_parse(&self, name: &str) -> Result<Option<String>> {
         let out = Command::new("git")
             .arg("-C")
             .arg(&self.repo)
@@ -426,11 +327,7 @@ impl Store {
             return Ok(None);
         }
         let s = String::from_utf8(out.stdout)?.trim().to_string();
-        if s.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(s))
-        }
+        if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
     }
 
     fn cat_blob(&self, spec: &str) -> Result<Option<Vec<u8>>> {
@@ -454,7 +351,6 @@ enum BlobSource {
 fn run_git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
     if !out.status.success() {
-        // Treat missing ref as empty.
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("unknown revision") || err.contains("Not a valid object") {
             return Ok(Vec::new());
@@ -465,7 +361,6 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 /// Run `git cat-file --batch` for many object specs at once.
-/// Returns Some(bytes) per input or None if the object is missing.
 fn batch_cat_blobs(repo: &Path, specs: Vec<String>) -> Result<Vec<Option<Vec<u8>>>> {
     if specs.is_empty() {
         return Ok(Vec::new());
@@ -480,7 +375,6 @@ fn batch_cat_blobs(repo: &Path, specs: Vec<String>) -> Result<Vec<Option<Vec<u8>
         .spawn()?;
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    // Send all queries.
     let send_specs = specs.clone();
     let sender = std::thread::spawn(move || -> std::io::Result<()> {
         for s in &send_specs {
@@ -496,7 +390,6 @@ fn batch_cat_blobs(repo: &Path, specs: Vec<String>) -> Result<Vec<Option<Vec<u8>
         let mut header = String::new();
         reader.read_line(&mut header)?;
         let header = header.trim_end();
-        // header is either "<oid> <type> <size>" or "<spec> missing"
         if header.ends_with(" missing") {
             out.push(None);
             continue;
@@ -536,29 +429,6 @@ fn sha_from_blob_path(p: &str) -> Option<String> {
     let rest = p.strip_prefix("blobs/")?.strip_suffix(".bin")?;
     let (a, b) = rest.split_once('/')?;
     Some(format!("{a}{b}"))
-}
-
-/// `path` is the source-file path inside the user's repo. We can't store
-/// it verbatim under `files/` because it may contain `..`, leading slashes,
-/// or characters that git's tree format dislikes. Instead we name the file
-/// by its SHA1, and store the original path inside the JSON.
-fn path_to_files_subpath(path: &str) -> String {
-    use sha1::Digest;
-    let mut h = sha1::Sha1::new();
-    h.update(path.as_bytes());
-    let d = h.finalize();
-    let hex = hex_lower(&d);
-    format!("files/{}/{}.json", &hex[..2], &hex[2..])
-}
-
-fn hex_lower(b: &[u8]) -> String {
-    const H: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(b.len() * 2);
-    for &x in b {
-        s.push(H[(x >> 4) as usize] as char);
-        s.push(H[(x & 0xf) as usize] as char);
-    }
-    s
 }
 
 // ---------- payload encoding ----------
@@ -610,7 +480,9 @@ pub fn unpack_payload(bytes: &[u8]) -> Result<(usize, Vec<(u32, u32)>, Vec<f32>)
     Ok((dim, ranges, vecs))
 }
 
-pub fn peek_n(bytes: &[u8]) -> Option<u32> { decode_n(bytes) }
+pub fn peek_n(bytes: &[u8]) -> Option<u32> {
+    decode_n(bytes)
+}
 
 fn decode_n(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < 12 || &bytes[..4] != b"VGRP" {

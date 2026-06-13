@@ -128,7 +128,7 @@ fn main() -> Result<()> {
             }
 
             let t_load = Instant::now();
-            let idx = Index::load(&s)?;
+            let idx = Index::load(&root, &s)?;
             if verbose {
                 eprintln!(
                     "[search] loaded {} vectors in {:.3}s",
@@ -161,6 +161,8 @@ fn main() -> Result<()> {
                     start_line: u32,
                     end_line: u32,
                     score: f32,
+                    blob_sha: &'a str,
+                    chunk_idx: u32,
                 }
                 let out: Vec<HitJson> = hits
                     .iter()
@@ -169,6 +171,8 @@ fn main() -> Result<()> {
                         start_line: h.start_line,
                         end_line: h.end_line,
                         score: h.score,
+                        blob_sha: &h.blob_sha,
+                        chunk_idx: h.chunk_idx,
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out)?);
@@ -197,15 +201,15 @@ fn main() -> Result<()> {
             let choice = embedder::parse_model(&cli.model)?;
             let s = Store::open(&root, choice.canonical_id, choice.dim).context("open store")?;
             let id = choice.canonical_id;
-            let n_files = s.files.len();
+            let pairs = crate::indexer::list_tracked_with_blobs(&root)?;
+            let n_files = pairs.len();
             let known = s.known_blob_shas()?;
             let n_blobs = known.len();
-            // Sum chunks across all payloads in one batch.
             let mut n_chunks: u64 = 0;
             let blobs_size = {
                 let payloads = s.iter_all_payloads()?;
                 let mut total = 0u64;
-                for (_p, _sha, b) in &payloads {
+                for (_sha, b) in &payloads {
                     total += b.len() as u64;
                     if let Some(n) = crate::store::peek_n(b) {
                         n_chunks += n as u64;
@@ -215,7 +219,7 @@ fn main() -> Result<()> {
             };
             println!("ref:      {}", store::REF_NAME);
             println!("model:    {}", id);
-            println!("files:    {}", n_files);
+            println!("files:    {} tracked (textual)", n_files);
             println!("chunks:   {}", n_chunks);
             println!("blobs:    {} unique", n_blobs);
             println!("payload:  {:.1} MB (uncompressed; git packs further)", blobs_size as f64 / 1e6);

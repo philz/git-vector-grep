@@ -1,10 +1,15 @@
-//! In-memory cosine search: pull all chunk vectors out of SQLite into a
-//! contiguous f32 matrix, then dot-product against the (already-normalized)
-//! query vector. Uses rayon for the scan.
+//! In-memory cosine search.
+//!
+//! We don't store path -> blob_sha; that mapping comes from `git ls-files -s`
+//! on every search. One winning chunk corresponds to one blob_sha; we then
+//! emit one hit per path currently pointing at that blob.
 
 use anyhow::Result;
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::path::Path;
 
+use crate::indexer::list_tracked_with_blobs;
 use crate::store::{unpack_payload, Store};
 
 #[derive(Debug, Clone)]
@@ -20,32 +25,40 @@ pub struct Hit {
 pub struct Index {
     pub dim: usize,
     pub matrix: Vec<f32>, // (n_rows * dim) f32
-    /// meta[i] = (path, blob_sha, idx, start, end)
-    pub meta: Vec<(String, String, u32, u32, u32)>,
+    /// meta[i] = (blob_sha, chunk_idx, start_line, end_line)
+    pub meta: Vec<(String, u32, u32, u32)>,
+    /// blob_sha -> all currently-tracked paths backed by that blob.
+    pub blob_to_paths: HashMap<String, Vec<String>>,
 }
 
 impl Index {
-    pub fn load(store: &Store) -> Result<Self> {
+    pub fn load(repo: &Path, store: &Store) -> Result<Self> {
         let payloads = store.iter_all_payloads()?;
         let mut matrix: Vec<f32> = Vec::new();
         let mut meta = Vec::new();
         let mut dim = store.meta.dim;
-        for (path, sha, bytes) in payloads {
+        for (sha, bytes) in payloads {
             let (d, ranges, vecs) = unpack_payload(&bytes)?;
             dim = d;
             for (i, (s, e)) in ranges.iter().enumerate() {
                 matrix.extend_from_slice(&vecs[i * d..(i + 1) * d]);
-                meta.push((path.clone(), sha.clone(), i as u32, *s, *e));
+                meta.push((sha.clone(), i as u32, *s, *e));
             }
         }
-        Ok(Self { dim, matrix, meta })
+        let mut blob_to_paths: HashMap<String, Vec<String>> = HashMap::new();
+        for (path, sha) in list_tracked_with_blobs(repo)? {
+            blob_to_paths.entry(sha).or_default().push(path);
+        }
+        Ok(Self { dim, matrix, meta, blob_to_paths })
     }
 
     pub fn len(&self) -> usize {
         self.meta.len()
     }
 
-    /// Top-k by cosine similarity (qvec assumed L2-normalized).
+    /// Top-k hits. If a winning chunk's blob maps to multiple paths, we emit
+    /// one hit per path (all at the same score). `top_k` bounds the number
+    /// of chunks scanned-and-selected, not the number of emitted rows.
     pub fn search(
         &self,
         qvec: &[f32],
@@ -60,53 +73,81 @@ impl Index {
         let dim = self.dim;
         let n = self.meta.len();
 
-        // Score in parallel; bind path-prefix filter inside the closure.
+        // Pre-compute per-row passability of the path filter: a row passes
+        // iff at least one path bound to its blob_sha matches the prefix.
+        let row_passes: Vec<bool> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let sha = &self.meta[i].0;
+                let Some(paths) = self.blob_to_paths.get(sha) else {
+                    return false;
+                };
+                if let Some(p) = path_prefix {
+                    paths.iter().any(|x| x.starts_with(p))
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         let scores: Vec<f32> = (0..n)
             .into_par_iter()
             .map(|i| {
-                if let Some(p) = path_prefix {
-                    if !self.meta[i].0.starts_with(p) {
-                        return f32::NEG_INFINITY;
-                    }
+                if !row_passes[i] {
+                    return f32::NEG_INFINITY;
                 }
                 let row = &self.matrix[i * dim..(i + 1) * dim];
                 dot(row, qvec)
             })
             .collect();
 
-        // Top-k selection (simple partial sort).
         let k = k.min(n);
+        if k == 0 {
+            return Vec::new();
+        }
         let mut idx: Vec<usize> = (0..n).collect();
         idx.select_nth_unstable_by(k.saturating_sub(1).min(n - 1), |&a, &b| {
             scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal)
         });
         let mut top = idx[..k].to_vec();
-        top.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+        top.sort_by(|&a, &b| {
+            scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        top.into_iter()
-            .filter_map(|i| {
-                let s = scores[i];
-                if !s.is_finite() {
-                    return None;
+        let mut out = Vec::with_capacity(k);
+        for i in top {
+            let s = scores[i];
+            if !s.is_finite() {
+                continue;
+            }
+            let m = &self.meta[i];
+            let paths = match self.blob_to_paths.get(&m.0) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            for path in paths {
+                if let Some(p) = path_prefix {
+                    if !path.starts_with(p) {
+                        continue;
+                    }
                 }
-                let m = &self.meta[i];
-                Some(Hit {
-                    path: m.0.clone(),
-                    start_line: m.3,
-                    end_line: m.4,
+                out.push(Hit {
+                    path,
+                    start_line: m.2,
+                    end_line: m.3,
                     score: s,
-                    blob_sha: m.1.clone(),
-                    chunk_idx: m.2,
-                })
-            })
-            .collect()
+                    blob_sha: m.0.clone(),
+                    chunk_idx: m.1,
+                });
+            }
+        }
+        out
     }
 }
 
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    // Manual unroll helps autovectorization on stable Rust without portable-simd.
     let mut s0 = 0f32;
     let mut s1 = 0f32;
     let mut s2 = 0f32;
