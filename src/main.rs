@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::embedder::{AnyEmbedder, Embedder, RemoteEmbedder};
+use crate::embedder::Embedder;
 use crate::store::Store;
 use crate::indexer::index_repo;
 use crate::repo::find_repo_root;
@@ -29,25 +29,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "minilm")]
     model: String,
 
-    /// Override ONNX intra-op threads (default: all cores).
+    /// Number of parallel embedding workers (default: all cores).
+    /// Each worker holds its own ONNX session with intra_threads=1.
     #[arg(long, global = true)]
-    threads: Option<usize>,
-
-    /// Use the exe.dev LLM gateway for embeddings instead of local ONNX.
-    /// Much faster on small VMs; requires network. The cache is keyed by
-    /// `--remote-model` so it won't collide with local-model caches.
-    #[arg(long, global = true)]
-    remote: bool,
-
-    /// Remote embedding model id (default: openai/text-embedding-3-small).
-    #[arg(long, global = true, default_value = "openai/text-embedding-3-small")]
-    remote_model: String,
-
-    /// Remote embedding dim (default 512: a Matryoshka truncation of
-    /// text-embedding-3-small that keeps most of the quality at 1/3 the
-    /// storage).
-    #[arg(long, global = true, default_value_t = 512)]
-    remote_dim: usize,
+    workers: Option<usize>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -59,7 +44,8 @@ enum Cmd {
     Index {
         #[arg(short, long)]
         verbose: bool,
-        #[arg(long, default_value_t = 64)]
+        /// ONNX batch size per worker. Lower if you OOM; 8 is conservative.
+        #[arg(long, default_value_t = 16)]
         batch_size: usize,
     },
     /// Search the repo. Will refresh the cache first unless --no-auto-index.
@@ -82,7 +68,7 @@ enum Cmd {
         json: bool,
         #[arg(short, long)]
         verbose: bool,
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 16)]
         batch_size: usize,
     },
     /// Print cache stats.
@@ -91,15 +77,8 @@ enum Cmd {
     Clear {},
 }
 
-fn build_embedder(cli: &Cli) -> Result<AnyEmbedder> {
-    if cli.remote {
-        Ok(AnyEmbedder::Remote(RemoteEmbedder::exe_gateway(
-            &cli.remote_model,
-            cli.remote_dim,
-        )))
-    } else {
-        Ok(AnyEmbedder::Local(Embedder::new(&cli.model, cli.threads)?))
-    }
+fn build_embedder(cli: &Cli) -> Result<Embedder> {
+    Embedder::new(&cli.model, cli.workers)
 }
 
 fn main() -> Result<()> {
@@ -110,15 +89,15 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index { verbose, batch_size } => {
             let t0 = Instant::now();
-            let mut emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, emb.model_id(), emb.dim())?;
+            let emb = build_embedder(&cli)?;
+            let mut s = Store::open(&root, &emb.model_id, emb.dim)?;
             if verbose {
                 eprintln!(
-                    "[index] repo={} model={} dim={} ref={}",
-                    root.display(), emb.model_id(), emb.dim(), store::REF_NAME
+                    "[index] repo={} model={} dim={} workers={} ref={}",
+                    root.display(), emb.model_id, emb.dim, emb.workers, store::REF_NAME
                 );
             }
-            let stats = index_repo(&root, &mut s, &mut emb, batch_size, verbose)?;
+            let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
             s.commit()?;
             eprintln!("[index] {}", stats);
             eprintln!("[index] wall: {:.2}s", t0.elapsed().as_secs_f64());
@@ -137,11 +116,11 @@ fn main() -> Result<()> {
             let q = query.join(" ");
             anyhow::ensure!(!q.is_empty(), "query is empty");
 
-            let mut emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, emb.model_id(), emb.dim())?;
+            let emb = build_embedder(&cli)?;
+            let mut s = Store::open(&root, &emb.model_id, emb.dim)?;
 
             if !no_auto_index {
-                let stats = index_repo(&root, &mut s, &mut emb, batch_size, verbose)?;
+                let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
                 if verbose {
                     eprintln!("[index] {}", stats);
                 }
@@ -215,13 +194,9 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats {} => {
-            let (id, dim) = if cli.remote {
-                (cli.remote_model.as_str(), cli.remote_dim)
-            } else {
-                let (_e, id, dim) = embedder::parse_model(&cli.model)?;
-                (id, dim)
-            };
-            let s = Store::open(&root, id, dim).context("open store")?;
+            let choice = embedder::parse_model(&cli.model)?;
+            let s = Store::open(&root, choice.canonical_id, choice.dim).context("open store")?;
+            let id = choice.canonical_id;
             let n_files = s.files.len();
             let known = s.known_blob_shas()?;
             let n_blobs = known.len();

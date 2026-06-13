@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::chunker::{chunk_bytes, Chunk};
-use crate::embedder::AnyEmbedder;
+use crate::embedder::Embedder;
 use crate::repo::{git_blob_sha1, list_tracked, looks_textual, modified_paths};
 use crate::store::Store;
 
@@ -60,7 +60,7 @@ impl std::fmt::Display for IndexStats {
 pub fn index_repo(
     root: &Path,
     cache: &mut Store,
-    embedder: &mut AnyEmbedder,
+    embedder: &Embedder,
     batch_size: usize,
     verbose: bool,
 ) -> Result<IndexStats> {
@@ -273,7 +273,7 @@ pub fn index_repo(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
-    let dim = embedder.dim();
+    let dim = embedder.dim;
 
     let mut blob_order: Vec<String> = pending_texts.keys().cloned().collect();
     blob_order.sort();
@@ -303,7 +303,7 @@ pub fn index_repo(
     let mut flush = |group: &mut Vec<(String, Vec<String>)>,
                      group_chunks: &mut usize,
                      sha_to_vecs: &mut HashMap<String, Vec<f32>>,
-                     embedder: &mut AnyEmbedder|
+                     embedder: &Embedder|
      -> Result<()> {
         if group.is_empty() {
             return Ok(());

@@ -30,17 +30,23 @@ Because the per-content payload is stored under git's blob SHA, you get:
 ## Backend
 
 Local-only, ONNX via `fastembed-rs`. The default model is
-`sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, ~85 MB),
-chosen because (a) it's small enough to run on a 2-CPU laptop and (b) it
-still matches arcaneum's bge-class results on code identifier queries.
+`sentence-transformers/all-MiniLM-L6-v2` (384-D, 22M params, 6 transformer
+layers, ~85 MB on disk). 6 layers turned out to win on CPU even against
+static-INT8 `BGESmallENV15Q` on Zen 4: fewer layers > VNNI uplift.
 
-Override with `--model {minilm,bge-small,bge-base,jina-code,jina-en,...}`.
-For real code search on a beefier machine, `--model jina-code` (jina-v2-base-code,
-768-D, code-specific training) is the recommended upgrade -- about 3×
-slower indexing but better semantic matches.
+Override with `--model {minilm,bge-small,bge-small-q,bge-base,jina-code}`.
 
-An opt-in remote backend (`--remote`) exists for OpenAI-compatible
-`/v1/embeddings` endpoints, but is disabled by default.
+## CPU parallelism
+
+For tiny transformer encoders, one ORT session with `intra_threads=8`
+scales sub-linearly past ~2 threads. We instead spawn **one ORT session
+per worker thread, each pinned to `intra_threads=1`**, and shard work
+across workers with rayon. On an 8-core box this is roughly 3-4× the
+throughput of the single-session approach.
+
+Worker count defaults to roughly `min(cpus, (RAM_GB - 1.5) / 0.75)` --
+model weights and activation arenas grow per session. Override with
+`--workers N`. Lower `--batch-size` if you OOM (default 16).
 
 ## Why it's fast
 
@@ -98,34 +104,34 @@ The cache **self-invalidates** if the model id or dim changes.
 - **Embeddings** are L2-normalized at write time so search is a plain dot
   product.
 
-## Benchmarks (local ONNX, MiniLM-L6-v2, 2-CPU exe.dev VM)
+## Benchmarks (local ONNX, MiniLM-L6-v2)
 
 **arcaneum** (272 files, 6.6k chunks):
 
-| Phase | Time |
-|---|---:|
-| Cold index | 6 min 12 s |
-| Incremental, clean tree | 0.2 s |
-| Rename | 0.2 s (32 chunks reused) |
-| Search end-to-end | 0.2 s |
+| Phase | 2 CPUs | 8 CPUs (Zen 4) |
+|---|---:|---:|
+| Cold index | 6 min 12 s | **2 min 20 s** (~2.7×) |
+| Incremental | 0.2 s | 0.2 s |
+| Search | 0.2 s | 0.2 s |
 
-**exe.git** (4319 files, 74k chunks, 4223 unique blobs):
+**exe.git** (4262 textual files, 69k unique chunks, 4169 unique blobs):
 
-| Phase | Time |
-|---|---:|
-| Cold index | **65 min** |
-| Peak RSS during index | **~2.5 GB** |
-| Incremental, clean tree | 0.6 s |
-| Search end-to-end | 1.2 s (1.0 s loading vectors, 8 ms scan) |
-| Pack size added to `.git` | ~114 MB |
+| Phase | 2 CPUs | 8 CPUs (Zen 4) |
+|---|---:|---:|
+| Cold index | 65 min | **26 min 36 s** (~2.5×) |
+| Peak RSS during index | 2.5 GB | 5.7 GB |
+| Incremental, clean tree | 0.6 s | 1.1 s |
+| Search end-to-end | 1.2 s | 1.7 s |
+| Pack size added to `.git` | ~114 MB | ~114 MB |
 
-Cold-index is entirely CPU-bound on this 2-CPU VM; the user-time is ~12 min
-which scales near-linearly with cores. On a 16-core laptop expect ~8 min.
+Cold-index speedup is sub-linear vs. CPU count because each ORT session
+has its own model weights + activation arena; you can't run as many
+workers in parallel as you have cores without OOMing. The current sweet
+spot on the 8 GB / 8-CPU box is **8 workers × batch_size=8**.
 
-Memory is bounded by `GVG_CHUNK_GROUP` (default 512 chunks). The whole
-repo's chunks are processed in groups; each group is length-bucketed for
-padding efficiency, embedded, written, and freed before the next group
-starts. Lower the value if you OOM, raise it if you have spare RAM.
+The ~1 s of "search end-to-end" is dominated by streaming vectors out of
+the pack via `git cat-file --batch`; the in-memory dot-product over 73k
+vectors is ~3 ms.
 
 ## Inspiration
 
