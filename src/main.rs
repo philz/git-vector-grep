@@ -9,7 +9,7 @@ mod store;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::embedder::Embedder;
@@ -75,6 +75,31 @@ enum Cmd {
     Stats {},
     /// Delete the cache.
     Clear {},
+    /// Push the cache ref to a remote. History is linear so plain pushes
+    /// fast-forward; pass --force to clobber a divergent remote.
+    Push {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Force-push (last-writer-wins). The cache is reproducible.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fetch the cache ref from a remote.
+    Pull {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Add a fetch refspec so plain `git fetch` picks up the cache ref.
+    ConfigRemote {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Collapse history of the cache ref into a single commit and suggest
+    /// `git gc --prune=now` to reclaim space.
+    Gc {},
 }
 
 fn build_embedder(cli: &Cli) -> Result<Embedder> {
@@ -223,6 +248,89 @@ fn main() -> Result<()> {
             println!("chunks:   {}", n_chunks);
             println!("blobs:    {} unique", n_blobs);
             println!("payload:  {:.1} MB (uncompressed; git packs further)", blobs_size as f64 / 1e6);
+        }
+        Cmd::Push { remote, force } => {
+            let refspec = format!("{0}:{0}", store::REF_NAME);
+            let mut args: Vec<&str> = vec!["-C"];
+            let root_s = root.to_string_lossy().into_owned();
+            args.push(&root_s);
+            args.push("push");
+            if force {
+                args.push("--force");
+            }
+            args.push(&remote);
+            args.push(&refspec);
+            let status = std::process::Command::new("git").args(&args).status()?;
+            if !status.success() {
+                anyhow::bail!("git push failed");
+            }
+        }
+        Cmd::Pull { remote } => {
+            let refspec = format!("+{0}/*:{0}/*", "refs/vector-grep");
+            let status = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["fetch", &remote, &refspec])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("git fetch failed");
+            }
+        }
+        Cmd::ConfigRemote { remote } => {
+            let key = format!("remote.{}.fetch", remote);
+            let val = "+refs/vector-grep/*:refs/vector-grep/*";
+            // Check if already present; only add if missing.
+            let existing = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["config", "--get-all", &key])
+                .output()?;
+            let body = String::from_utf8_lossy(&existing.stdout);
+            if body.lines().any(|l| l.trim() == val) {
+                println!("already configured");
+            } else {
+                let status = std::process::Command::new("git")
+                    .arg("-C").arg(&root)
+                    .args(["config", "--add", &key, val])
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("git config --add failed");
+                }
+                println!("added fetch refspec to remote.{}", remote);
+            }
+        }
+        Cmd::Gc {} => {
+            // Rewrite the ref to a single commit pointing at the current tree.
+            let head = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["rev-parse", "--verify", "--quiet", store::REF_NAME])
+                .output()?;
+            if !head.status.success() {
+                println!("no cache ref to gc");
+                return Ok(());
+            }
+            let tip = String::from_utf8(head.stdout)?.trim().to_string();
+            let tree = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["rev-parse", &format!("{}^{{tree}}", tip)])
+                .output()?;
+            anyhow::ensure!(tree.status.success(), "git rev-parse tree failed");
+            let tree = String::from_utf8(tree.stdout)?.trim().to_string();
+            let ct = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .env("GIT_AUTHOR_NAME", "git-vector-grep")
+                .env("GIT_AUTHOR_EMAIL", "vgrep@local")
+                .env("GIT_COMMITTER_NAME", "git-vector-grep")
+                .env("GIT_COMMITTER_EMAIL", "vgrep@local")
+                .args(["commit-tree", &tree, "-m", "git-vector-grep gc"])
+                .output()?;
+            anyhow::ensure!(ct.status.success(), "git commit-tree failed: {}", String::from_utf8_lossy(&ct.stderr));
+            let new_tip = String::from_utf8(ct.stdout)?.trim().to_string();
+            let up = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["update-ref", store::REF_NAME, &new_tip, &tip])
+                .status()?;
+            anyhow::ensure!(up.success(), "git update-ref failed");
+            println!("collapsed history: {} -> {}", &tip[..12], &new_tip[..12]);
+            println!("run `git -C {} gc --prune=now` to reclaim space", root.display());
         }
         Cmd::Clear {} => {
             let out = std::process::Command::new("git")
