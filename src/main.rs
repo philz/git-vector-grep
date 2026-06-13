@@ -115,11 +115,11 @@ fn main() -> Result<()> {
         Cmd::Index { verbose, batch_size } => {
             let t0 = Instant::now();
             let emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, &emb.model_id, emb.dim)?;
+            let mut s = Store::open(&root, emb.short_id, emb.dim)?;
             if verbose {
                 eprintln!(
                     "[index] repo={} model={} dim={} workers={} ref={}",
-                    root.display(), emb.model_id, emb.dim, emb.workers, store::REF_NAME
+                    root.display(), emb.model_id, emb.dim, emb.workers, s.ref_name
                 );
             }
             let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(!q.is_empty(), "query is empty");
 
             let emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, &emb.model_id, emb.dim)?;
+            let mut s = Store::open(&root, emb.short_id, emb.dim)?;
 
             if !no_auto_index {
                 let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
@@ -224,8 +224,7 @@ fn main() -> Result<()> {
         }
         Cmd::Stats {} => {
             let choice = embedder::parse_model(&cli.model)?;
-            let s = Store::open(&root, choice.canonical_id, choice.dim).context("open store")?;
-            let id = choice.canonical_id;
+            let s = Store::open(&root, choice.short_id, choice.dim).context("open store")?;
             let pairs = crate::indexer::list_tracked_with_blobs(&root)?;
             let n_files = pairs.len();
             let known = s.known_blob_shas()?;
@@ -242,15 +241,19 @@ fn main() -> Result<()> {
                 }
                 total
             };
-            println!("ref:      {}", store::REF_NAME);
-            println!("model:    {}", id);
+            println!("ref:      {}", s.ref_name);
+            println!("model:    {} ({})", choice.short_id, choice.canonical_id);
+            println!("dim:      {}", choice.dim);
             println!("files:    {} tracked (textual)", n_files);
             println!("chunks:   {}", n_chunks);
             println!("blobs:    {} unique", n_blobs);
             println!("payload:  {:.1} MB (uncompressed; git packs further)", blobs_size as f64 / 1e6);
         }
         Cmd::Push { remote, force } => {
-            let refspec = format!("{0}:{0}", store::REF_NAME);
+            // Push *all* model caches for this repo. Each model lives at a
+            // distinct ref under refs/notes/vector-grep/<short_id>, so a
+            // single namespace refspec pushes the lot.
+            let refspec = format!("{0}/*:{0}/*", store::NOTES_REF_PREFIX);
             let mut args: Vec<&str> = vec!["-C"];
             let root_s = root.to_string_lossy().into_owned();
             args.push(&root_s);
@@ -266,7 +269,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Pull { remote } => {
-            let refspec = format!("+{0}/*:{0}/*", "refs/vector-grep");
+            let refspec = format!("+{0}/*:{0}/*", store::NOTES_REF_PREFIX);
             let status = std::process::Command::new("git")
                 .arg("-C").arg(&root)
                 .args(["fetch", &remote, &refspec])
@@ -277,7 +280,13 @@ fn main() -> Result<()> {
         }
         Cmd::ConfigRemote { remote } => {
             let key = format!("remote.{}.fetch", remote);
-            let val = "+refs/vector-grep/*:refs/vector-grep/*";
+            let val = format!("+{0}/*:{0}/*", store::NOTES_REF_PREFIX);
+            // Also wire union merge so `git notes merge` Just Works for
+            // the two-clients-pushing-disjoint-blobs case.
+            let _ = std::process::Command::new("git")
+                .arg("-C").arg(&root)
+                .args(["config", "notes.mergeStrategy", "union"])
+                .status();
             // Check if already present; only add if missing.
             let existing = std::process::Command::new("git")
                 .arg("-C").arg(&root)
@@ -289,7 +298,7 @@ fn main() -> Result<()> {
             } else {
                 let status = std::process::Command::new("git")
                     .arg("-C").arg(&root)
-                    .args(["config", "--add", &key, val])
+                    .args(["config", "--add", &key, &val])
                     .status()?;
                 if !status.success() {
                     anyhow::bail!("git config --add failed");
@@ -298,13 +307,15 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Gc {} => {
-            // Rewrite the ref to a single commit pointing at the current tree.
+            // Collapse history for the *current model's* cache ref.
+            let choice = embedder::parse_model(&cli.model)?;
+            let ref_name = store::ref_for(choice.short_id);
             let head = std::process::Command::new("git")
                 .arg("-C").arg(&root)
-                .args(["rev-parse", "--verify", "--quiet", store::REF_NAME])
+                .args(["rev-parse", "--verify", "--quiet", &ref_name])
                 .output()?;
             if !head.status.success() {
-                println!("no cache ref to gc");
+                println!("no cache ref to gc: {}", ref_name);
                 return Ok(());
             }
             let tip = String::from_utf8(head.stdout)?.trim().to_string();
@@ -326,19 +337,22 @@ fn main() -> Result<()> {
             let new_tip = String::from_utf8(ct.stdout)?.trim().to_string();
             let up = std::process::Command::new("git")
                 .arg("-C").arg(&root)
-                .args(["update-ref", store::REF_NAME, &new_tip, &tip])
+                .args(["update-ref", &ref_name, &new_tip, &tip])
                 .status()?;
             anyhow::ensure!(up.success(), "git update-ref failed");
-            println!("collapsed history: {} -> {}", &tip[..12], &new_tip[..12]);
+            println!("collapsed history of {}: {} -> {}", ref_name, &tip[..12], &new_tip[..12]);
             println!("run `git -C {} gc --prune=now` to reclaim space", root.display());
         }
         Cmd::Clear {} => {
+            // Delete just the current model's ref.
+            let choice = embedder::parse_model(&cli.model)?;
+            let ref_name = store::ref_for(choice.short_id);
             let out = std::process::Command::new("git")
                 .arg("-C").arg(&root)
-                .args(["update-ref", "-d", store::REF_NAME])
+                .args(["update-ref", "-d", &ref_name])
                 .output()?;
             if out.status.success() {
-                println!("deleted ref {}", store::REF_NAME);
+                println!("deleted ref {}", ref_name);
             } else {
                 eprintln!("git update-ref: {}", String::from_utf8_lossy(&out.stderr));
             }

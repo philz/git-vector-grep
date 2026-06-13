@@ -36,7 +36,7 @@ impl Index {
         let payloads = store.iter_all_payloads()?;
         let mut matrix: Vec<f32> = Vec::new();
         let mut meta = Vec::new();
-        let mut dim = store.meta.dim;
+        let mut dim = store.dim;
         for (sha, bytes) in payloads {
             let (d, ranges, vecs) = unpack_payload(&bytes)?;
             dim = d;

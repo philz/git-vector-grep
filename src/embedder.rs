@@ -12,13 +12,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Canonical model id recorded in the cache `meta.json`.
-pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-pub const DEFAULT_DIM: usize = 384;
-
 #[derive(Clone)]
 pub struct ModelChoice {
     pub enum_id: EmbeddingModel,
     pub canonical_id: &'static str,
+    /// Short, stable slug used as the notes-ref segment
+    /// (`refs/notes/vector-grep/<short_id>`). Must match `[a-z0-9-]+`.
+    pub short_id: &'static str,
     pub dim: usize,
 }
 
@@ -27,26 +27,31 @@ pub fn parse_model(name: &str) -> Result<ModelChoice> {
         "bge-small-q" | "BAAI/bge-small-en-v1.5-quantized" => ModelChoice {
             enum_id: EmbeddingModel::BGESmallENV15Q,
             canonical_id: "BAAI/bge-small-en-v1.5-quantized",
+            short_id: "bge-small-q",
             dim: 384,
         },
         "bge-small" | "BAAI/bge-small-en-v1.5" => ModelChoice {
             enum_id: EmbeddingModel::BGESmallENV15,
             canonical_id: "BAAI/bge-small-en-v1.5",
+            short_id: "bge-small",
             dim: 384,
         },
         "bge-base" | "BAAI/bge-base-en-v1.5" => ModelChoice {
             enum_id: EmbeddingModel::BGEBaseENV15,
             canonical_id: "BAAI/bge-base-en-v1.5",
+            short_id: "bge-base",
             dim: 768,
         },
         "minilm" | "sentence-transformers/all-MiniLM-L6-v2" => ModelChoice {
             enum_id: EmbeddingModel::AllMiniLML6V2,
             canonical_id: "sentence-transformers/all-MiniLM-L6-v2",
+            short_id: "minilm",
             dim: 384,
         },
         "jina-code" | "jinaai/jina-embeddings-v2-base-code" => ModelChoice {
             enum_id: EmbeddingModel::JinaEmbeddingsV2BaseCode,
             canonical_id: "jinaai/jina-embeddings-v2-base-code",
+            short_id: "jina-code",
             dim: 768,
         },
         other => anyhow::bail!("unknown model: {other}"),
@@ -78,6 +83,7 @@ fn new_session(choice: &ModelChoice) -> Result<TextEmbedding> {
 /// scheduling, but the Mutex is needed to satisfy `Send`+`Sync`.
 pub struct Embedder {
     pub model_id: String,
+    pub short_id: &'static str,
     pub dim: usize,
     pub workers: usize,
     sessions: Vec<Mutex<TextEmbedding>>,
@@ -107,6 +113,7 @@ impl Embedder {
             .collect::<Result<_>>()?;
         Ok(Embedder {
             model_id: choice.canonical_id.to_string(),
+            short_id: choice.short_id,
             dim: choice.dim,
             workers,
             sessions,
