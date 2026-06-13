@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: build linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: build (musl static)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: package
+        id: pkg
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/git-vector-grep
+          test -x "$BIN"
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          OUT="git-vector-grep-${VERSION}-x86_64-unknown-linux-musl"
+          mkdir -p dist/$OUT
+          cp "$BIN" dist/$OUT/git-vector-grep
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/$OUT/ 2>/dev/null || true
+          tar -C dist -czf dist/$OUT.tar.gz $OUT
+          (cd dist && sha256sum $OUT.tar.gz > $OUT.tar.gz.sha256)
+          ls -la dist/
+          echo "asset=dist/$OUT.tar.gz" >> $GITHUB_OUTPUT
+          echo "sha=dist/$OUT.tar.gz.sha256" >> $GITHUB_OUTPUT
+
+      - name: upload artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+
+      - name: release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
