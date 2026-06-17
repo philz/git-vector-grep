@@ -86,6 +86,7 @@ pub fn index_repo(
     embedder: &Embedder,
     batch_size: usize,
     verbose: bool,
+    quiet: bool,
 ) -> Result<IndexStats> {
     let t0 = Instant::now();
     let mut stats = IndexStats::default();
@@ -164,12 +165,21 @@ pub fn index_repo(
     let dim = embedder.dim;
 
     let total_chunks: usize = chunked.iter().map(|c| c.texts.len()).sum();
+    // Progress is shown unless silenced (--quiet, JSON output, or a
+    // non-terminal stderr). Verbose keeps the old per-group line output.
+    let show_progress = !quiet && !verbose && total_chunks > 0;
     if verbose && total_chunks > 0 {
         eprintln!(
             "[index] embedding {} chunks across {} unique blobs in groups of \u{2264}{}...",
             total_chunks,
             chunked.len(),
             chunk_group,
+        );
+    } else if show_progress {
+        eprintln!(
+            "indexing: embedding {} new chunks from {} blobs...",
+            total_chunks,
+            chunked.len(),
         );
     }
 
@@ -182,7 +192,7 @@ pub fn index_repo(
     let mut groups_done = 0usize;
     let mut chunks_done = 0usize;
 
-    let mut flush = |group: &mut Vec<Chunked>,
+    let flush = |group: &mut Vec<Chunked>,
                      group_chunks: &mut usize,
                      cache: &mut Store,
                      embedder: &Embedder|
@@ -221,18 +231,28 @@ pub fn index_repo(
         Ok(chunks_in_flush)
     };
 
+    let report = |groups_done: usize, chunks_done: usize| {
+        if verbose {
+            eprintln!(
+                "[index] ... group {} done ({} chunks total)",
+                groups_done, chunks_done
+            );
+        } else if show_progress {
+            let pct = (chunks_done as f64 / total_chunks as f64 * 100.0).min(100.0);
+            eprint!(
+                "\rindexing: {}/{} chunks ({:.0}%)   ",
+                chunks_done, total_chunks, pct
+            );
+        }
+    };
+
     for c in chunked {
         let n = c.texts.len();
         if group_chunks > 0 && group_chunks + n > chunk_group {
             let did = flush(&mut group, &mut group_chunks, cache, embedder)?;
             chunks_done += did;
             groups_done += 1;
-            if verbose {
-                eprintln!(
-                    "[index] ... group {} done ({} chunks total)",
-                    groups_done, chunks_done
-                );
-            }
+            report(groups_done, chunks_done);
         }
         group_chunks += n;
         group.push(c);
@@ -240,16 +260,14 @@ pub fn index_repo(
             let did = flush(&mut group, &mut group_chunks, cache, embedder)?;
             chunks_done += did;
             groups_done += 1;
-            if verbose {
-                eprintln!(
-                    "[index] ... group {} done ({} chunks total)",
-                    groups_done, chunks_done
-                );
-            }
+            report(groups_done, chunks_done);
         }
     }
     let did = flush(&mut group, &mut group_chunks, cache, embedder)?;
     chunks_done += did;
+    if show_progress {
+        eprintln!("\rindexing: {} chunks done.            ", chunks_done);
+    }
     stats.chunks_embedded = chunks_done;
     stats.blobs_embedded = stats.blobs_unique - stats.blobs_already_cached - stats.blobs_skipped;
 

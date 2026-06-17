@@ -19,23 +19,63 @@ use crate::repo::find_repo_root;
 use crate::search::Index;
 
 #[derive(Parser, Debug)]
-#[command(name = "git-vector-grep", version, about = "Vector grep over a git repo")]
+#[command(
+    name = "git-vector-grep",
+    version,
+    about = "Semantic (vector) code search over a git repo: embeds your tracked \
+             text files locally on CPU, caches the vectors in git, and ranks \
+             chunks by meaning rather than exact keywords.",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
-    /// Path inside the git repo (default: cwd).
+    /// Path inside the git repo. Defaults to the current directory.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
 
-    /// Embedding model: jina-code (default), jina-en, bge-small, bge-base, minilm.
+    /// Embedding model. One of: minilm, bge-small, bge-small-q, bge-base, jina-code.
     #[arg(long, global = true, default_value = "minilm")]
     model: String,
 
-    /// Number of parallel embedding workers (default: all cores).
+    /// Number of parallel embedding workers. Defaults to the number of CPU cores.
     /// Each worker holds its own ONNX session with intra_threads=1.
     #[arg(long, global = true)]
     workers: Option<usize>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+
+    /// Search query (the default action when no subcommand is given).
+    #[command(flatten)]
+    search: SearchArgs,
+}
+
+#[derive(clap::Args, Debug, Default)]
+struct SearchArgs {
+    /// Query string.
+    query: Vec<String>,
+    /// Number of results to return.
+    #[arg(short = 'k', long, default_value_t = 10)]
+    top_k: usize,
+    /// Restrict matches to paths starting with this prefix.
+    #[arg(long)]
+    path: Option<String>,
+    /// Print the matching chunk text.
+    #[arg(long)]
+    show: bool,
+    /// Skip the incremental reindex.
+    #[arg(long)]
+    no_auto_index: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    json: bool,
+    /// Suppress indexing progress output.
+    #[arg(short, long)]
+    quiet: bool,
+    #[arg(short, long)]
+    verbose: bool,
+    /// ONNX batch size per worker. Lower if you OOM.
+    #[arg(long, default_value_t = 16)]
+    batch_size: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,33 +84,15 @@ enum Cmd {
     Index {
         #[arg(short, long)]
         verbose: bool,
+        /// Suppress indexing progress output.
+        #[arg(short, long)]
+        quiet: bool,
         /// ONNX batch size per worker. Lower if you OOM; 8 is conservative.
         #[arg(long, default_value_t = 16)]
         batch_size: usize,
     },
     /// Search the repo. Will refresh the cache first unless --no-auto-index.
-    Search {
-        /// Query string.
-        query: Vec<String>,
-        #[arg(short = 'k', long, default_value_t = 10)]
-        top_k: usize,
-        /// Restrict matches to paths starting with this prefix.
-        #[arg(long)]
-        path: Option<String>,
-        /// Print the matching chunk text.
-        #[arg(long)]
-        show: bool,
-        /// Skip the incremental reindex.
-        #[arg(long)]
-        no_auto_index: bool,
-        /// Emit JSON.
-        #[arg(long)]
-        json: bool,
-        #[arg(short, long)]
-        verbose: bool,
-        #[arg(long, default_value_t = 16)]
-        batch_size: usize,
-    },
+    Search(SearchArgs),
     /// Print cache stats.
     Stats {},
     /// Delete the cache.
@@ -107,12 +129,23 @@ fn build_embedder(cli: &Cli) -> Result<Embedder> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // No subcommand and no query: print help instead of erroring.
+    if cli.cmd.is_none() && cli.search.query.is_empty() {
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
+
     let start_dir = cli.repo.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
     let root = find_repo_root(&start_dir)?;
 
-    match cli.cmd {
-        Cmd::Index { verbose, batch_size } => {
+    let cmd = cli.cmd.take().unwrap_or_else(|| Cmd::Search(std::mem::take(&mut cli.search)));
+
+    match cmd {
+        Cmd::Index { verbose, quiet, batch_size } => {
             let t0 = Instant::now();
             let emb = build_embedder(&cli)?;
             let mut s = Store::open(&root, emb.short_id, emb.dim)?;
@@ -122,30 +155,37 @@ fn main() -> Result<()> {
                     root.display(), emb.model_id, emb.dim, emb.workers, s.ref_name
                 );
             }
-            let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
+            let stats = index_repo(&root, &mut s, &emb, batch_size, verbose, quiet)?;
             s.commit()?;
-            eprintln!("[index] {}", stats);
-            eprintln!("[index] wall: {:.2}s", t0.elapsed().as_secs_f64());
+            if !quiet {
+                eprintln!("[index] {}", stats);
+                eprintln!("[index] wall: {:.2}s", t0.elapsed().as_secs_f64());
+            }
         }
-        Cmd::Search {
-            ref query,
-            top_k,
-            ref path,
-            show,
-            no_auto_index,
-            json,
-            verbose,
-            batch_size,
-        } => {
+        Cmd::Search(args) => {
+            let SearchArgs {
+                query,
+                top_k,
+                path,
+                show,
+                no_auto_index,
+                json,
+                quiet,
+                verbose,
+                batch_size,
+            } = args;
             let t0 = Instant::now();
             let q = query.join(" ");
-            anyhow::ensure!(!q.is_empty(), "query is empty");
+            anyhow::ensure!(!q.is_empty(), "query is empty (usage: git-vector-grep <search terms>)");
+
+            // JSON output should stay machine-clean; silence progress then.
+            let quiet = quiet || json;
 
             let emb = build_embedder(&cli)?;
             let mut s = Store::open(&root, emb.short_id, emb.dim)?;
 
             if !no_auto_index {
-                let stats = index_repo(&root, &mut s, &emb, batch_size, verbose)?;
+                let stats = index_repo(&root, &mut s, &emb, batch_size, verbose, quiet)?;
                 if verbose {
                     eprintln!("[index] {}", stats);
                 }

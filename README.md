@@ -13,8 +13,8 @@ across branches, renames, and machines for free.
 ## What it does
 
 ```
-$ git-vector-grep index                   # one-time, incremental thereafter
-$ git-vector-grep search "how do we chunk PDFs" -k 5
+$ git-vector-grep "how do we chunk PDFs" -k 5   # search is the default action
+                                                # (indexes on first run)
 0.6122  src/arcaneum/indexing/pdf/chunker.py:49-68
 0.6061  docs/rdr/RDR-014-markdown-indexing.md:129-148
 ...
@@ -54,10 +54,12 @@ Consequences:
 ## Usage
 
 ```
-git-vector-grep index                        # incremental reindex
-git-vector-grep search QUERY -k 10           # top-k cosine search
-git-vector-grep search QUERY --show          # with snippet text
-git-vector-grep search QUERY --path src/     # restrict by prefix
+git-vector-grep QUERY -k 10                  # top-k cosine search (default action)
+git-vector-grep QUERY --show                 # with snippet text
+git-vector-grep QUERY --path src/            # restrict by prefix
+git-vector-grep QUERY -q                      # suppress indexing progress
+git-vector-grep search QUERY                 # explicit search subcommand (same thing)
+git-vector-grep index                        # just (re)build the cache
 git-vector-grep stats                        # what's cached
 
 git-vector-grep config-remote --remote origin   # one-time setup
