@@ -1,22 +1,16 @@
 //! git-vector-grep: fast CPU vector grep over a git repo.
 
-mod chunker;
-mod embedder;
-mod indexer;
-mod repo;
-mod search;
-mod store;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::embedder::Embedder;
-use crate::store::Store;
-use crate::indexer::index_repo;
-use crate::repo::find_repo_root;
-use crate::search::Index;
+use git_vector_grep::{embedder, indexer, search, store};
+use embedder::Embedder;
+use store::Store;
+use indexer::index_repo;
+use git_vector_grep::repo::find_repo_root;
+use search::Index;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,10 +30,18 @@ struct Cli {
     #[arg(long, global = true, default_value = "minilm")]
     model: String,
 
-    /// Number of parallel embedding workers. Defaults to the number of CPU cores.
-    /// Each worker holds its own ONNX session with intra_threads=1.
+    /// Number of ONNX sessions (CPU backend). Default 1: a single session that
+    /// uses all cores via intra-op threads, in one memory arena (~1 GB). Each
+    /// extra session adds another full model + arena, so raise this only to
+    /// trade memory for parallelism on a big-RAM machine.
     #[arg(long, global = true)]
     workers: Option<usize>,
+
+    /// Embedding backend: auto | cpu | mlx. `auto` uses the Apple GPU (mlx) on
+    /// Apple Silicon when the model supports it, else falls back to CPU/ONNX.
+    /// MLX caches live under `mlx-*` notes refs (they coexist with CPU caches).
+    #[arg(long, global = true, default_value = "auto")]
+    backend: String,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -124,8 +126,56 @@ enum Cmd {
     Gc {},
 }
 
-fn build_embedder(cli: &Cli) -> Result<Embedder> {
-    Embedder::new(&cli.model, cli.workers)
+/// Whether to use the MLX (Apple GPU) backend for this invocation.
+fn want_mlx(cli: &Cli) -> bool {
+    match cli.backend.as_str() {
+        "mlx" => true,
+        "cpu" => false,
+        _ => {
+            // auto: use MLX when compiled in and the model has an MLX variant.
+            #[cfg(mlx)]
+            {
+                git_vector_grep::mlx_embed::parse_mlx_model(&cli.model).is_ok()
+            }
+            #[cfg(not(mlx))]
+            {
+                false
+            }
+        }
+    }
+}
+
+fn build_embedder(cli: &Cli) -> Result<Box<dyn git_vector_grep::embed::Embed>> {
+    if want_mlx(cli) {
+        #[cfg(mlx)]
+        {
+            match git_vector_grep::mlx_embed::MlxEmbedder::new(&cli.model) {
+                Ok(e) => return Ok(Box::new(e)),
+                Err(e) if cli.backend == "auto" => {
+                    eprintln!("[mlx] unavailable ({e}); falling back to CPU/ONNX");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(mlx))]
+        if cli.backend == "mlx" {
+            anyhow::bail!("--backend mlx is only available on Apple Silicon builds");
+        }
+    }
+    Ok(Box::new(Embedder::new(&cli.model, cli.workers)?))
+}
+
+/// Resolve (short_id, dim) without loading a model — for stats/clear/gc.
+fn resolve_spec(cli: &Cli) -> Result<(String, usize)> {
+    if want_mlx(cli) {
+        #[cfg(mlx)]
+        {
+            let s = git_vector_grep::mlx_embed::parse_mlx_model(&cli.model)?;
+            return Ok((s.short_id.to_string(), s.dim));
+        }
+    }
+    let c = embedder::parse_model(&cli.model)?;
+    Ok((c.short_id.to_string(), c.dim))
 }
 
 fn main() -> Result<()> {
@@ -148,14 +198,14 @@ fn main() -> Result<()> {
         Cmd::Index { verbose, quiet, batch_size } => {
             let t0 = Instant::now();
             let emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, emb.short_id, emb.dim)?;
+            let mut s = Store::open(&root, emb.short_id(), emb.dim())?;
             if verbose {
                 eprintln!(
-                    "[index] repo={} model={} dim={} workers={} ref={}",
-                    root.display(), emb.model_id, emb.dim, emb.workers, s.ref_name
+                    "[index] repo={} model={} dim={} backend={} ref={}",
+                    root.display(), emb.model_id(), emb.dim(), cli.backend, s.ref_name
                 );
             }
-            let stats = index_repo(&root, &mut s, &emb, batch_size, verbose, quiet)?;
+            let stats = index_repo(&root, &mut s, emb.as_ref(), batch_size, verbose, quiet)?;
             s.commit()?;
             if !quiet {
                 eprintln!("[index] {}", stats);
@@ -182,10 +232,10 @@ fn main() -> Result<()> {
             let quiet = quiet || json;
 
             let emb = build_embedder(&cli)?;
-            let mut s = Store::open(&root, emb.short_id, emb.dim)?;
+            let mut s = Store::open(&root, emb.short_id(), emb.dim())?;
 
             if !no_auto_index {
-                let stats = index_repo(&root, &mut s, &emb, batch_size, verbose, quiet)?;
+                let stats = index_repo(&root, &mut s, emb.as_ref(), batch_size, verbose, quiet)?;
                 if verbose {
                     eprintln!("[index] {}", stats);
                 }
@@ -263,9 +313,9 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats {} => {
-            let choice = embedder::parse_model(&cli.model)?;
-            let s = Store::open(&root, choice.short_id, choice.dim).context("open store")?;
-            let pairs = crate::indexer::list_tracked_with_blobs(&root)?;
+            let (short_id, dim) = resolve_spec(&cli)?;
+            let s = Store::open(&root, &short_id, dim).context("open store")?;
+            let pairs = indexer::list_tracked_with_blobs(&root)?;
             let n_files = pairs.len();
             let known = s.known_blob_shas()?;
             let n_blobs = known.len();
@@ -275,15 +325,15 @@ fn main() -> Result<()> {
                 let mut total = 0u64;
                 for (_sha, b) in &payloads {
                     total += b.len() as u64;
-                    if let Some(n) = crate::store::peek_n(b) {
+                    if let Some(n) = store::peek_n(b) {
                         n_chunks += n as u64;
                     }
                 }
                 total
             };
             println!("ref:      {}", s.ref_name);
-            println!("model:    {} ({})", choice.short_id, choice.canonical_id);
-            println!("dim:      {}", choice.dim);
+            println!("model:    {} (backend: {})", short_id, cli.backend);
+            println!("dim:      {}", dim);
             println!("files:    {} tracked (textual)", n_files);
             println!("chunks:   {}", n_chunks);
             println!("blobs:    {} unique", n_blobs);
@@ -348,8 +398,8 @@ fn main() -> Result<()> {
         }
         Cmd::Gc {} => {
             // Collapse history for the *current model's* cache ref.
-            let choice = embedder::parse_model(&cli.model)?;
-            let ref_name = store::ref_for(choice.short_id);
+            let (short_id, _dim) = resolve_spec(&cli)?;
+            let ref_name = store::ref_for(&short_id);
             let head = std::process::Command::new("git")
                 .arg("-C").arg(&root)
                 .args(["rev-parse", "--verify", "--quiet", &ref_name])
@@ -385,8 +435,8 @@ fn main() -> Result<()> {
         }
         Cmd::Clear {} => {
             // Delete just the current model's ref.
-            let choice = embedder::parse_model(&cli.model)?;
-            let ref_name = store::ref_for(choice.short_id);
+            let (short_id, _dim) = resolve_spec(&cli)?;
+            let ref_name = store::ref_for(&short_id);
             let out = std::process::Command::new("git")
                 .arg("-C").arg(&root)
                 .args(["update-ref", "-d", &ref_name])

@@ -1,1 +1,8 @@
 /target
+# Generated benchmark corpora (large; rebuild with the `corpus` binary)
+/bench/corpus/*.bin
+# Vector dumps from `bench --dump`
+/bench/*.bin
+# Swift build artifacts
+/bench/swift-mlx/.build/
+/bench/swift-mlx/Package.resolved

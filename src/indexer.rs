@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::chunker::chunk_bytes;
-use crate::embedder::Embedder;
+use crate::embed::Embed;
 use crate::repo::{git_blob_sha1, list_tracked, looks_textual, modified_paths};
 use crate::store::Store;
 
@@ -83,7 +83,7 @@ pub fn list_tracked_with_blobs(root: &Path) -> Result<Vec<(String, String)>> {
 pub fn index_repo(
     root: &Path,
     cache: &mut Store,
-    embedder: &Embedder,
+    embedder: &dyn Embed,
     batch_size: usize,
     verbose: bool,
     quiet: bool,
@@ -162,9 +162,14 @@ pub fn index_repo(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
-    let dim = embedder.dim;
+    let dim = embedder.dim();
 
     let total_chunks: usize = chunked.iter().map(|c| c.texts.len()).sum();
+    // Announce the active backend + its resource caps + how to tweak them,
+    // whenever we're about to actually embed (and not silenced).
+    if total_chunks > 0 && !quiet {
+        eprintln!("[embed] {}", embedder.describe());
+    }
     // Progress is shown unless silenced (--quiet, JSON output, or a
     // non-terminal stderr). Verbose keeps the old per-group line output.
     let show_progress = !quiet && !verbose && total_chunks > 0;
@@ -195,7 +200,7 @@ pub fn index_repo(
     let flush = |group: &mut Vec<Chunked>,
                      group_chunks: &mut usize,
                      cache: &mut Store,
-                     embedder: &Embedder|
+                     embedder: &dyn Embed|
      -> Result<usize> {
         if group.is_empty() {
             return Ok(0);

@@ -86,10 +86,40 @@ Rust 1.75+:
 
 ```
 cargo build --release
-# -> ./target/release/git-vector-grep (~28 MB; bundles ONNX Runtime)
+# -> ./target/release/git-vector-grep
 ```
 
-Prebuilt Linux x86_64 binaries are attached to each GitHub release.
+On **non-Apple-Silicon** (Linux, Intel Mac) this is a pure CPU/ONNX binary with
+no extra dependencies. Prebuilt Linux x86_64 binaries are attached to each
+GitHub release.
+
+### Apple-GPU backend (automatic on Apple Silicon)
+
+On an Apple-Silicon Mac, `cargo build` **automatically** compiles in the GPU
+embedding backend ([mlx-rs](https://github.com/oxideai/mlx-rs)) and uses it by
+default at runtime — same single Rust binary, faster cold index at full context
+in a fraction of the RAM. The one build-time requirement is the Metal Toolchain
+(mlx-sys compiles MLX + its metallib):
+
+```
+xcodebuild -downloadComponent MetalToolchain   # one-time, ~688 MB
+cargo build --release                          # GPU backend included automatically
+```
+
+Then it's automatic at runtime:
+
+```
+git-vector-grep "how do we chunk PDFs"     # --backend auto (default): uses the GPU
+git-vector-grep --backend cpu QUERY        # force CPU/ONNX (no GPU needed)
+git-vector-grep --backend mlx QUERY        # force GPU
+```
+
+`auto` (the default) uses MLX when the model has an MLX variant (`minilm`,
+`bge-small`, `bge-base`), else falls back to CPU/ONNX. MLX caches live under
+their own `mlx-*` notes refs, so GPU and CPU indexes coexist and never mix. Each
+index prints the active backend and its caps, e.g.
+`[embed] mlx/apple-gpu · mlx-minilm · GPU buffer-cache cap 512 MB · ~0.4 GB peak`.
+See `bench/RESULTS.md` for the full backend comparison.
 
 ## Performance
 

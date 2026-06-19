@@ -11,6 +11,36 @@ use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::embed::Embed;
+
+impl Embed for Embedder {
+    fn embed_flat(&self, texts: Vec<String>, batch_size: usize) -> Result<Vec<f32>> {
+        Embedder::embed_flat(self, texts, batch_size)
+    }
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        Embedder::embed_query(self, text)
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn short_id(&self) -> &str {
+        self.short_id
+    }
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    fn describe(&self) -> String {
+        let n = self.sessions.len();
+        // Rough peak: ~1.5 GB per ONNX session arena + ~0.3 GB base.
+        let est_gb = n as f32 * 1.5 + 0.3;
+        format!(
+            "cpu/onnx · {} · {} session(s) × {} intra-threads · ~{:.1} GB peak · \
+             tweak: --workers N for more speed (~+1.5 GB/session), or --backend mlx for the GPU",
+            self.short_id, n, self.intra_threads, est_gb
+        )
+    }
+}
+
 /// Canonical model id recorded in the cache `meta.json`.
 #[derive(Clone)]
 pub struct ModelChoice {
@@ -66,14 +96,13 @@ pub fn default_cache_dir() -> PathBuf {
     }
 }
 
-fn new_session(choice: &ModelChoice) -> Result<TextEmbedding> {
+fn new_session(choice: &ModelChoice, intra_threads: usize) -> Result<TextEmbedding> {
     let cache_dir = default_cache_dir();
     std::fs::create_dir_all(&cache_dir).ok();
     let opts = InitOptions::new(choice.enum_id.clone())
         .with_show_download_progress(false)
         .with_cache_dir(cache_dir)
-        // Pin intra-op to 1; we parallelize across sessions instead.
-        .with_intra_threads(1);
+        .with_intra_threads(intra_threads.max(1));
     TextEmbedding::try_new(opts).context("failed to load embedding model")
 }
 
@@ -86,6 +115,7 @@ pub struct Embedder {
     pub short_id: &'static str,
     pub dim: usize,
     pub workers: usize,
+    pub intra_threads: usize,
     sessions: Vec<Mutex<TextEmbedding>>,
     /// One session reserved for query embedding (cheap; serial).
     query_session: Mutex<TextEmbedding>,
@@ -94,28 +124,29 @@ pub struct Embedder {
 impl Embedder {
     pub fn new(model_name: &str, workers: Option<usize>) -> Result<Self> {
         let choice = parse_model(model_name)?;
-        // Default: assume ~700 MB per worker at the default batch size
-        // (empirically measured for MiniLM-f32 at batch=8). Cap by core count
-        // and by total RAM minus 1.5 GB of OS headroom.
-        let workers = workers.unwrap_or_else(|| {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            let ram_gb = sys_total_ram_gb().unwrap_or(8.0);
-            let by_ram = ((ram_gb - 1.5) / 0.75).floor().max(1.0) as usize;
-            cpus.min(by_ram).max(1)
-        }).max(1);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Each ORT session carries its own model copy *and* a monotonically-
+        // growing activation arena, so N sessions cost ~N× memory — that's what
+        // drove indexing to 10+ GB. Default to ONE session that uses all cores
+        // via intra-op threads: same throughput ballpark in a single arena
+        // (~1 GB instead of ~N GB). `--workers N` splits into N sessions
+        // (cpus/N threads each) to trade memory for more parallelism.
+        let workers = workers.unwrap_or(1).max(1);
+        let intra = (cpus / workers).max(1);
         // Load the model once to warm caches, then spawn N sessions in parallel.
-        let query_session = Mutex::new(new_session(&choice)?);
+        let query_session = Mutex::new(new_session(&choice, intra)?);
         let sessions: Vec<Mutex<TextEmbedding>> = (0..workers)
             .into_par_iter()
-            .map(|_| new_session(&choice).map(Mutex::new))
+            .map(|_| new_session(&choice, intra).map(Mutex::new))
             .collect::<Result<_>>()?;
         Ok(Embedder {
             model_id: choice.canonical_id.to_string(),
             short_id: choice.short_id,
             dim: choice.dim,
             workers,
+            intra_threads: intra,
             sessions,
             query_session,
         })
@@ -202,21 +233,4 @@ pub fn l2_normalize_rows(buf: &mut [f32], dim: usize) {
             }
         }
     }
-}
-
-/// Rough total-RAM probe via /proc/meminfo. Returns gigabytes.
-fn sys_total_ram_gb() -> Option<f64> {
-    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .trim()
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
-            return Some(kb as f64 / 1_048_576.0);
-        }
-    }
-    None
 }
