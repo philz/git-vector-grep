@@ -1,8 +1,9 @@
 //! Bring the cache up to date with the current repo state.
 //!
-//! The cache is purely a function of the multiset of source blob SHAs that
-//! make up the repo's tracked text files. No path mapping is stored: paths
-//! are reconstructed at search time from `git ls-files -s`.
+//! The cache is an append-only union of source blob SHAs seen in any worktree.
+//! No path mapping is stored: paths are reconstructed at search time from
+//! `git ls-files -s`, and search only loads payloads referenced by the current
+//! worktree.
 //!
 //! Algorithm:
 //!   1. `git ls-files -s` -> (path, index_blob_sha) per tracked file.
@@ -10,8 +11,8 @@
 //!      index; for these, recompute the blob SHA from disk bytes.
 //!   3. target = set of unique blob_shas for tracked textual files.
 //!   4. existing = `git ls-tree -r REF blobs/`.
-//!   5. Embed target - existing.
-//!   6. Commit a tree containing exactly `target`'s blobs (orphans pruned).
+//!   5. Embed target - existing, checkpointing each bounded group.
+//!   6. Keep existing notes so other branches and interrupted runs stay cached.
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -31,6 +32,7 @@ pub struct IndexStats {
     pub blobs_already_cached: usize,
     pub blobs_embedded: usize,
     pub blobs_skipped: usize,
+    /// Retained for API compatibility; append-only caches do not prune.
     pub blobs_pruned: usize,
     pub chunks_embedded: usize,
     pub elapsed_ms: u128,
@@ -40,24 +42,26 @@ impl std::fmt::Display for IndexStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "files: {} | blobs: {} unique, {} cached, {} embedded, {} skipped, {} pruned | chunks embedded: {} | {}ms",
+            "files: {} | blobs: {} unique, {} cached, {} embedded, {} skipped | chunks embedded: {} | {}ms",
             self.files_total,
             self.blobs_unique,
             self.blobs_already_cached,
             self.blobs_embedded,
             self.blobs_skipped,
-            self.blobs_pruned,
             self.chunks_embedded,
             self.elapsed_ms,
         )
     }
 }
 
-/// (path, blob_sha) for every tracked textual file in `root`.
-///
-/// Cheap: one `git ls-files -s` + one `git diff --name-only`; for files in
-/// the diff we recompute the SHA by reading bytes off disk.
-pub fn list_tracked_with_blobs(root: &Path) -> Result<Vec<(String, String)>> {
+#[derive(Clone)]
+struct TrackedBlob {
+    path: String,
+    sha: String,
+    raw_sha: bool,
+}
+
+fn list_tracked_with_blob_details(root: &Path) -> Result<Vec<TrackedBlob>> {
     let tracked = list_tracked(root)?;
     let tracked: Vec<_> = tracked
         .into_iter()
@@ -65,19 +69,36 @@ pub fn list_tracked_with_blobs(root: &Path) -> Result<Vec<(String, String)>> {
         .collect();
     let modified: HashSet<String> = modified_paths(root)?.into_iter().collect();
 
-    let pairs: Vec<(String, String)> = tracked
+    Ok(tracked
         .into_par_iter()
         .filter_map(|f| {
             if modified.contains(&f.path) {
                 let bytes = std::fs::read(root.join(&f.path)).ok()?;
-                let sha = git_blob_sha1(&bytes);
-                Some((f.path, sha))
+                Some(TrackedBlob {
+                    path: f.path,
+                    sha: git_blob_sha1(&bytes),
+                    raw_sha: true,
+                })
             } else {
-                Some((f.path, f.index_blob_sha))
+                Some(TrackedBlob {
+                    path: f.path,
+                    sha: f.index_blob_sha,
+                    raw_sha: false,
+                })
             }
         })
-        .collect();
-    Ok(pairs)
+        .collect())
+}
+
+/// (path, blob_sha) for every tracked textual file in `root`.
+///
+/// Cheap: one `git ls-files -s` + one `git diff --name-only`; for files in
+/// the diff we recompute the SHA by reading bytes off disk.
+pub fn list_tracked_with_blobs(root: &Path) -> Result<Vec<(String, String)>> {
+    Ok(list_tracked_with_blob_details(root)?
+        .into_iter()
+        .map(|f| (f.path, f.sha))
+        .collect())
 }
 
 pub fn index_repo(
@@ -92,17 +113,16 @@ pub fn index_repo(
     let mut stats = IndexStats::default();
 
     // 1-2. Tracked paths + their authoritative blob SHAs.
-    let pairs = list_tracked_with_blobs(root)?;
-    stats.files_total = pairs.len();
+    let tracked = list_tracked_with_blob_details(root)?;
+    stats.files_total = tracked.len();
 
     // 3. Target set of unique blob SHAs.
-    let target_blobs: HashSet<String> = pairs.iter().map(|(_, s)| s.clone()).collect();
+    let target_blobs: HashSet<String> = tracked.iter().map(|f| f.sha.clone()).collect();
     stats.blobs_unique = target_blobs.len();
 
     // 4. What's already on the ref.
     let known_blobs = cache.known_blob_shas()?;
     stats.blobs_already_cached = target_blobs.intersection(&known_blobs).count();
-    stats.blobs_pruned = known_blobs.difference(&target_blobs).count();
 
     // 5. Blobs we need to embed = target - known.
     let mut to_embed: Vec<String> = target_blobs
@@ -112,18 +132,22 @@ pub fn index_repo(
     to_embed.sort();
 
     if to_embed.is_empty() {
-        // Still need to apply pruning if the on-disk set differs from target.
-        if known_blobs != target_blobs {
-            cache.set_referenced(target_blobs.clone());
-        }
         stats.elapsed_ms = t0.elapsed().as_millis();
         return Ok(stats);
     }
 
     // Pick one canonical path per blob_sha so we can read bytes off disk.
-    let mut sha_to_path: HashMap<String, String> = HashMap::new();
-    for (path, sha) in &pairs {
-        sha_to_path.entry(sha.clone()).or_insert_with(|| path.clone());
+    // Prefer a path whose SHA was computed from raw working-tree bytes, since
+    // that is the only case where raw hashing is valid in the presence of git
+    // clean filters and line-ending normalization.
+    let mut sha_to_path: HashMap<String, (String, bool)> = HashMap::new();
+    for file in tracked {
+        let entry = sha_to_path
+            .entry(file.sha)
+            .or_insert_with(|| (file.path.clone(), file.raw_sha));
+        if file.raw_sha && !entry.1 {
+            *entry = (file.path, true);
+        }
     }
 
     // Read + chunk in parallel. We keep only line ranges + texts; the file
@@ -136,15 +160,15 @@ pub fn index_repo(
     let chunked: Vec<Chunked> = to_embed
         .par_iter()
         .filter_map(|sha| {
-            let path = sha_to_path.get(sha)?;
+            let (path, verify_raw_sha) = sha_to_path.get(sha)?;
             let bytes = std::fs::read(root.join(path)).ok()?;
-            // Defensive: working tree may have drifted under us mid-run.
-            // We already trust the SHA computed earlier from the same bytes
-            // (or from the index); recomputing here would be a race.
-            let chunks = chunk_bytes(&bytes);
-            if chunks.is_empty() {
+            // For modified paths, both the scheduled SHA and this check hash raw
+            // bytes. Index SHAs may include clean filters, so do not compare
+            // those against raw working-tree bytes.
+            if *verify_raw_sha && git_blob_sha1(&bytes) != *sha {
                 return None;
             }
+            let chunks = chunk_bytes(&bytes);
             let ranges = chunks.iter().map(|c| (c.start_line, c.end_line)).collect();
             let texts = chunks.into_iter().map(|c| c.text).collect();
             Some(Chunked {
@@ -218,7 +242,11 @@ pub fn index_repo(
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&i| texts[i].len());
         let sorted_texts: Vec<String> = order.iter().map(|&i| texts[i].clone()).collect();
-        let sorted_vecs = embedder.embed_flat(sorted_texts, batch_size)?;
+        let sorted_vecs = if sorted_texts.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed_flat(sorted_texts, batch_size)?
+        };
         let mut group_vecs = vec![0f32; n * dim];
         for (sp, &op) in order.iter().enumerate() {
             group_vecs[op * dim..(op + 1) * dim]
@@ -232,6 +260,9 @@ pub fn index_repo(
             pos += n_chunks;
             chunks_in_flush += n_chunks;
         }
+        // Persist every bounded group. A killed long-running index resumes from
+        // its last completed group instead of recomputing everything.
+        cache.commit()?;
         *group_chunks = 0;
         Ok(chunks_in_flush)
     };
@@ -275,9 +306,6 @@ pub fn index_repo(
     }
     stats.chunks_embedded = chunks_done;
     stats.blobs_embedded = stats.blobs_unique - stats.blobs_already_cached - stats.blobs_skipped;
-
-    // 6. Tell the store exactly which blobs should survive the next commit.
-    cache.set_referenced(target_blobs);
 
     stats.elapsed_ms = t0.elapsed().as_millis();
     Ok(stats)

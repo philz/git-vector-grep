@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::indexer::list_tracked_with_blobs;
@@ -32,13 +32,28 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn load(repo: &Path, store: &Store) -> Result<Self> {
-        let payloads = store.iter_all_payloads()?;
+    pub fn load(repo: &Path, store: &mut Store) -> Result<Self> {
+        let pairs = list_tracked_with_blobs(repo)?;
+        let current_shas: HashSet<String> = pairs.iter().map(|(_, sha)| sha.clone()).collect();
+        let known_shas = store.known_blob_shas()?;
+        let payloads = store.payloads_for(&current_shas)?;
+        let valid_shas: HashSet<String> = payloads.iter().map(|(sha, _)| sha.clone()).collect();
+        let invalid_shas: Vec<String> = current_shas
+            .intersection(&known_shas)
+            .filter(|sha| !valid_shas.contains(*sha))
+            .cloned()
+            .collect();
+        if !invalid_shas.is_empty() {
+            store.remove_blobs(invalid_shas);
+            store.commit()?;
+        }
         let mut matrix: Vec<f32> = Vec::new();
         let mut meta = Vec::new();
         let mut dim = store.dim;
         for (sha, bytes) in payloads {
-            let (d, ranges, vecs) = unpack_payload(&bytes)?;
+            let Ok((d, ranges, vecs)) = unpack_payload(&bytes) else {
+                continue;
+            };
             dim = d;
             for (i, (s, e)) in ranges.iter().enumerate() {
                 matrix.extend_from_slice(&vecs[i * d..(i + 1) * d]);
@@ -46,7 +61,7 @@ impl Index {
             }
         }
         let mut blob_to_paths: HashMap<String, Vec<String>> = HashMap::new();
-        for (path, sha) in list_tracked_with_blobs(repo)? {
+        for (path, sha) in pairs {
             blob_to_paths.entry(sha).or_default().push(path);
         }
         Ok(Self { dim, matrix, meta, blob_to_paths })

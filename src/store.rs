@@ -27,12 +27,14 @@
 //!   ranges  : [u32;2*n] LE  (start_line, end_line per chunk)
 //!   vecs    : [f32; n*dim] LE  (L2-normalized)
 //!
-//! Writes go through `git fast-import` (cheap path-by-OID re-listing for
-//! unchanged notes); reads through `git cat-file --batch`.
+//! Writes go through `git fast-import`, inheriting the previous notes tree and
+//! adding only new payloads; reads go through `git cat-file --batch`.
 
 use anyhow::{bail, Context, Result};
 use bytemuck::{cast_slice, cast_slice_mut};
+use fs2::FileExt;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -53,9 +55,8 @@ pub struct Store {
     pub dim: usize,
     /// Pending new note payloads, keyed by source blob_sha. Flushed by `commit()`.
     pub blob_payloads: HashMap<String, Vec<u8>>,
-    /// Blob SHAs that should survive the next `commit()`. Anything in the
-    /// existing notes tree not in here is pruned. None = keep everything.
-    referenced: Option<HashSet<String>>,
+    /// Invalid note paths to remove on the next commit.
+    deleted_shas: HashSet<String>,
     /// True if anything mutated.
     pub dirty: bool,
 }
@@ -68,7 +69,7 @@ impl Store {
             ref_name: ref_for(short_id),
             dim,
             blob_payloads: HashMap::new(),
-            referenced: None,
+            deleted_shas: HashSet::new(),
             dirty: false,
         })
     }
@@ -92,10 +93,10 @@ impl Store {
         Ok(set)
     }
 
-    /// Stream every (blob_sha, payload_bytes) currently in this notes ref,
-    /// in blob_sha order. One `git cat-file --batch` for the whole set.
-    pub fn iter_all_payloads(&self) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut shas: Vec<String> = self.known_blob_shas()?.into_iter().collect();
+    /// Stream payloads for a selected set of source blob SHAs, in SHA order.
+    /// Missing or incompatible notes are skipped.
+    pub fn payloads_for(&self, selected: &HashSet<String>) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut shas: Vec<String> = selected.iter().cloned().collect();
         shas.sort();
         let specs: Vec<String> = shas
             .iter()
@@ -105,16 +106,18 @@ impl Store {
         let mut out = Vec::with_capacity(shas.len());
         for (sha, bytes) in shas.into_iter().zip(cat) {
             if let Some(b) = bytes {
-                // Defensively reject payloads that don't match expectations.
-                if let Some(d) = peek_dim(&b) {
-                    if d as usize != self.dim {
-                        continue;
-                    }
+                if payload_valid(&b, self.dim) {
+                    out.push((sha, b));
                 }
-                out.push((sha, b));
             }
         }
         Ok(out)
+    }
+
+    /// Stream every payload currently in this notes ref, in blob SHA order.
+    pub fn iter_all_payloads(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let shas = self.known_blob_shas()?;
+        self.payloads_for(&shas)
     }
 
     pub fn insert_chunks(
@@ -129,10 +132,16 @@ impl Store {
         self.dirty = true;
     }
 
-    /// Set the exact set of blob SHAs that should be present after commit.
-    pub fn set_referenced(&mut self, set: HashSet<String>) {
-        self.referenced = Some(set);
-        self.dirty = true;
+    /// Kept for source compatibility with pre-append-only callers.
+    #[deprecated(note = "the cache is append-only; references are no longer pruned")]
+    pub fn set_referenced(&mut self, _set: HashSet<String>) {}
+
+    pub fn remove_blobs(&mut self, shas: impl IntoIterator<Item = String>) {
+        for sha in shas {
+            self.blob_payloads.remove(&sha);
+            self.deleted_shas.insert(sha);
+            self.dirty = true;
+        }
     }
 
     /// Materialize a new commit on `self.ref_name`, linear history.
@@ -140,12 +149,15 @@ impl Store {
         if !self.dirty {
             return Ok(());
         }
+        // Worktrees share the notes ref through their common git directory.
+        // Serialize ref snapshots so concurrent checkpoints cannot lose notes.
+        let _lock = self.commit_lock()?;
         let parent = self.rev_parse(&self.ref_name)?;
 
         let mut fi = Command::new("git")
             .arg("-C")
             .arg(&self.repo)
-            .args(["fast-import", "--quiet", "--force", "--date-format=raw"])
+            .args(["fast-import", "--quiet", "--force", "--done", "--date-format=raw"])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -158,26 +170,11 @@ impl Store {
             format!(":{}", next_mark)
         };
 
-        let existing_note_paths = self.existing_note_tree_paths()?;
-        let wrote_shas: HashSet<String> = self.blob_payloads.keys().cloned().collect();
-
-        let mut entries: Vec<(String, BlobSource)> = Vec::new();
+        let mut entries: Vec<(String, String)> = Vec::new();
         for (sha, bytes) in &self.blob_payloads {
             let mark = mk();
             write_blob_with_mark(stdin, &mark, bytes)?;
-            entries.push((note_subpath(sha), BlobSource::Mark(mark)));
-        }
-        for (path, oid) in existing_note_paths {
-            let Some(sha) = sha_from_note_path(&path) else { continue };
-            if let Some(ref ref_set) = self.referenced {
-                if !ref_set.contains(&sha) {
-                    continue;
-                }
-            }
-            if wrote_shas.contains(&sha) {
-                continue;
-            }
-            entries.push((path, BlobSource::Oid(oid)));
+            entries.push((note_subpath(sha), mark));
         }
 
         let now = std::time::SystemTime::now()
@@ -191,12 +188,11 @@ impl Store {
         if let Some(p) = parent {
             writeln!(stdin, "from {}", p)?;
         }
-        writeln!(stdin, "deleteall")?;
-        for (path, src) in &entries {
-            match src {
-                BlobSource::Mark(m) => writeln!(stdin, "M 100644 {} {}", m, path)?,
-                BlobSource::Oid(o) => writeln!(stdin, "M 100644 {} {}", o, path)?,
-            }
+        for sha in &self.deleted_shas {
+            writeln!(stdin, "D {}", note_subpath(sha))?;
+        }
+        for (path, mark) in &entries {
+            writeln!(stdin, "M 100644 {} {}", mark, path)?;
         }
         writeln!(stdin, "done")?;
         drop(fi.stdin.take());
@@ -207,30 +203,38 @@ impl Store {
                 String::from_utf8_lossy(&status.stderr)
             );
         }
+        self.blob_payloads.clear();
+        self.deleted_shas.clear();
         self.dirty = false;
         Ok(())
     }
 
-    fn existing_note_tree_paths(&self) -> Result<Vec<(String, String)>> {
-        if self.rev_parse(&self.ref_name)?.is_none() {
-            return Ok(Vec::new());
+    fn commit_lock(&self) -> Result<File> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["rev-parse", "--git-common-dir"])
+            .output()
+            .context("find git common directory")?;
+        if !out.status.success() {
+            bail!(
+                "git rev-parse --git-common-dir failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
-        let out = run_git(&self.repo, &["ls-tree", "-r", &self.ref_name])?;
-        let mut v = Vec::new();
-        for line in std::str::from_utf8(&out)?.lines() {
-            let (meta_part, path) = match line.split_once('\t') {
-                Some(p) => p,
-                None => continue,
-            };
-            let mut it = meta_part.split_whitespace();
-            let _mode = it.next();
-            let kind = it.next();
-            let oid = it.next().unwrap_or("");
-            if kind == Some("blob") && !oid.is_empty() {
-                v.push((path.to_string(), oid.to_string()));
-            }
-        }
-        Ok(v)
+        let common = PathBuf::from(String::from_utf8(out.stdout)?.trim());
+        let common = if common.is_absolute() { common } else { self.repo.join(common) };
+        let path = common.join(format!("vector-grep-{}.lock", self.short_id));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open index lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("lock index cache {}", path.display()))?;
+        Ok(file)
     }
 
     pub fn rev_parse(&self, name: &str) -> Result<Option<String>> {
@@ -245,11 +249,6 @@ impl Store {
         let s = String::from_utf8(out.stdout)?.trim().to_string();
         if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
     }
-}
-
-enum BlobSource {
-    Mark(String),
-    Oid(String),
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -291,28 +290,54 @@ fn batch_cat_blobs(repo: &Path, specs: Vec<String>) -> Result<Vec<Option<Vec<u8>
         Ok(())
     });
     let mut reader = BufReader::new(stdout);
-    let mut out = Vec::with_capacity(specs.len());
-    for _ in 0..specs.len() {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
-        let header = header.trim_end();
-        if header.ends_with(" missing") {
-            out.push(None);
-            continue;
+    let read_result = (|| -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(specs.len());
+        for _ in 0..specs.len() {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                bail!("git cat-file ended before returning every payload");
+            }
+            let header = header.trim_end();
+            if header.ends_with(" missing") {
+                out.push(None);
+                continue;
+            }
+            let mut it = header.split_whitespace();
+            let _oid = it.next().context("git cat-file response missing object id")?;
+            let ty = it.next().context("git cat-file response missing object type")?;
+            if ty != "blob" {
+                bail!("git cat-file returned unexpected object type: {}", ty);
+            }
+            let sz: usize = it
+                .next()
+                .context("git cat-file response missing object size")?
+                .parse()
+                .context("git cat-file returned invalid object size")?;
+            let mut buf = vec![0u8; sz];
+            reader.read_exact(&mut buf)?;
+            let mut nl = [0u8; 1];
+            reader.read_exact(&mut nl)?;
+            if nl[0] != b'\n' {
+                bail!("git cat-file payload missing terminator");
+            }
+            out.push(Some(buf));
         }
-        let mut it = header.split_whitespace();
-        let _oid = it.next();
-        let _ty = it.next();
-        let sz: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
-        let mut buf = vec![0u8; sz];
-        reader.read_exact(&mut buf)?;
-        let mut nl = [0u8; 1];
-        let _ = reader.read_exact(&mut nl);
-        out.push(Some(buf));
+        Ok(out)
+    })();
+    drop(reader);
+    let sender_result = sender.join();
+    let status = child.wait_with_output()?;
+    match sender_result {
+        Ok(result) => result.context("send git cat-file requests")?,
+        Err(_) => bail!("git cat-file request thread panicked"),
     }
-    let _ = sender.join();
-    let _ = child.wait();
-    Ok(out)
+    if !status.status.success() {
+        bail!(
+            "git cat-file failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    read_result
 }
 
 fn write_blob_with_mark(
@@ -362,6 +387,22 @@ fn pack_payload(dim: usize, ranges: &[(u32, u32)], vecs: &[f32]) -> Vec<u8> {
     out
 }
 
+fn payload_valid(bytes: &[u8], expected_dim: usize) -> bool {
+    if bytes.len() < 12 || &bytes[..4] != b"VGRP" {
+        return false;
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let dim = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    let n = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let Some(expected_len) = n
+        .checked_mul(8 + expected_dim.saturating_mul(4))
+        .and_then(|payload| payload.checked_add(12))
+    else {
+        return false;
+    };
+    version == SCHEMA && dim == expected_dim && bytes.len() == expected_len
+}
+
 pub fn unpack_payload(bytes: &[u8]) -> Result<(usize, Vec<(u32, u32)>, Vec<f32>)> {
     if bytes.len() < 12 || &bytes[..4] != b"VGRP" {
         bail!("bad payload magic");
@@ -374,8 +415,8 @@ pub fn unpack_payload(bytes: &[u8]) -> Result<(usize, Vec<(u32, u32)>, Vec<f32>)
     let n = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let ranges_bytes = 8 * n;
     let vec_bytes = 4 * dim * n;
-    if bytes.len() < 12 + ranges_bytes + vec_bytes {
-        bail!("payload truncated");
+    if bytes.len() != 12 + ranges_bytes + vec_bytes {
+        bail!("payload length mismatch");
     }
     let mut ranges = Vec::with_capacity(n);
     for i in 0..n {
@@ -396,11 +437,4 @@ pub fn peek_n(bytes: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]))
-}
-
-fn peek_dim(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() < 8 || &bytes[..4] != b"VGRP" {
-        return None;
-    }
-    Some(u16::from_le_bytes([bytes[6], bytes[7]]))
 }

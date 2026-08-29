@@ -1,8 +1,8 @@
 # git-vector-grep
 
 Semantic grep over a git repo. Single Rust binary; CPU-only; no daemon, no
-sidecar database, no external service. The embedding cache lives inside
-your repo as a **git notes ref**, so it ships over `git push` and dedups
+sidecar database, no external service. The append-only embedding cache lives
+inside your repo as a **git notes ref**, so it ships over `git push` and dedups
 across branches, renames, and machines for free.
 
 > ⚠️ **Caveat emptor: this is vibe-coded.** Built end-to-end in a few
@@ -41,8 +41,10 @@ Consequences:
 
 - **Renames are free.** Same content → same SHA → cache hit.
 - **Dedup is free.** Two identical files share one note.
-- **Branch switches are free.** Indexing a feature branch off main only
-  embeds the blobs unique to the branch.
+- **Branch switches are free.** The cache retains blob versions seen on other
+  branches, while search only loads blobs tracked by the current worktree.
+- **Interrupted indexing resumes.** Each bounded embedding group is committed,
+  so a later invocation starts from the last completed checkpoint.
 - **Sharing is free.** `git push` ships the cache; `git pull` receives it.
 - **Inspectable with stock git.** `git notes --ref=refs/notes/vector-grep/minilm list` etc.
 - **Mergeable with stock git.** `git notes merge --strategy=union` resolves
@@ -143,7 +145,9 @@ thing to fix, see `NEXT_STEPS.md`.
   Runtime. The only network call is the one-time model download from
   HuggingFace on first use of each model.
 - **No path table.** Paths come from `git ls-files -s` on every search
-  (~14 ms on a 5k-file repo). The cache only stores `(blob_sha → vectors)`.
+  (~14 ms on a 5k-file repo). The cache stores the append-only union of
+  `(blob_sha → vectors)` entries seen across worktrees, but search reads only
+  entries referenced by the current worktree.
 - **Stock git everything.** push/pull are `git push`/`git fetch`; gc is
   collapse-then-`git gc`; merge is `git notes merge --strategy=union`.
   We're a thin layer over git's existing notes machinery.

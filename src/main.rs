@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -243,7 +244,7 @@ fn main() -> Result<()> {
             }
 
             let t_load = Instant::now();
-            let idx = Index::load(&root, &s)?;
+            let idx = Index::load(&root, &mut s)?;
             if verbose {
                 eprintln!(
                     "[search] loaded {} vectors in {:.3}s",
@@ -317,11 +318,13 @@ fn main() -> Result<()> {
             let s = Store::open(&root, &short_id, dim).context("open store")?;
             let pairs = indexer::list_tracked_with_blobs(&root)?;
             let n_files = pairs.len();
+            let current: HashSet<String> = pairs.iter().map(|(_, sha)| sha.clone()).collect();
             let known = s.known_blob_shas()?;
             let n_blobs = known.len();
+            let payloads = s.payloads_for(&current)?;
+            let current_cached = payloads.len();
             let mut n_chunks: u64 = 0;
             let blobs_size = {
-                let payloads = s.iter_all_payloads()?;
                 let mut total = 0u64;
                 for (_sha, b) in &payloads {
                     total += b.len() as u64;
@@ -335,9 +338,14 @@ fn main() -> Result<()> {
             println!("model:    {} (backend: {})", short_id, cli.backend);
             println!("dim:      {}", dim);
             println!("files:    {} tracked (textual)", n_files);
-            println!("chunks:   {}", n_chunks);
-            println!("blobs:    {} unique", n_blobs);
-            println!("payload:  {:.1} MB (uncompressed; git packs further)", blobs_size as f64 / 1e6);
+            println!("chunks:   {} current cached", n_chunks);
+            println!(
+                "blobs:    {}/{} current cached ({} total cache entries)",
+                current_cached,
+                current.len(),
+                n_blobs
+            );
+            println!("payload:  {:.1} MB current cached (uncompressed)", blobs_size as f64 / 1e6);
         }
         Cmd::Push { remote, force } => {
             // Push *all* model caches for this repo. Each model lives at a

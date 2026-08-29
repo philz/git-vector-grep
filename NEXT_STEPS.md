@@ -71,9 +71,9 @@ better on identifier / API-shape queries.
 - `Embedder` keeps `Mutex<TextEmbedding>` per worker only to satisfy
   `Sync`; in practice each worker only ever touches its own session.
   Move to `thread_local!` or rayon-by-index without the Mutex.
-- Concurrent-indexer safety: two `git-vector-grep index` runs in the
-  same repo race on the ref. Add a `flock` on
-  `.git/vector-grep-<short_id>.lock` for the duration of `Store::commit()`.
+- Concurrent duplicate work: cache commits are serialized with a common-git-dir
+  lock, so notes are not lost, but two indexers can still embed the same missing
+  blobs. Consider a longer-lived planning lock with refresh-after-wait.
 - `--workers` default uses `available_parallelism()`, which on
   cgroup-constrained VMs returns the wrong answer. Read
   `/sys/fs/cgroup/cpu.max` when present.
