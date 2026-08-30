@@ -192,7 +192,7 @@ pub fn index_repo(
     // Announce the active backend + its resource caps + how to tweak them,
     // whenever we're about to actually embed (and not silenced).
     if total_chunks > 0 && !quiet {
-        eprintln!("[embed] {}", embedder.describe());
+        eprintln!("[embed] {} · batch {}", embedder.describe(), batch_size);
     }
     // Progress is shown unless silenced (--quiet, JSON output, or a
     // non-terminal stderr). Verbose keeps the old per-group line output.

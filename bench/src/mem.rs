@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// `mach_task_basic_info` (from `<mach/task_info.h>`). mach2 0.4 doesn't export
 /// this struct, so we mirror its layout and ask `task_info` to fill it.
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Default)]
 struct MachTaskBasicInfo {
@@ -23,6 +24,7 @@ struct MachTaskBasicInfo {
 }
 
 /// Current resident set size of this process, in bytes, via Mach `task_info`.
+#[cfg(target_os = "macos")]
 pub fn rss_bytes() -> u64 {
     use mach2::kern_return::KERN_SUCCESS;
     use mach2::message::mach_msg_type_number_t;
@@ -47,6 +49,26 @@ pub fn rss_bytes() -> u64 {
             0
         }
     }
+}
+
+/// Current resident set size on Linux, read from `/proc/self/status`.
+#[cfg(target_os = "linux")]
+pub fn rss_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn rss_bytes() -> u64 {
+    0
 }
 
 /// Tracks peak RSS and aborts if a budget is exceeded.

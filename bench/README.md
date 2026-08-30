@@ -1,8 +1,9 @@
 # vgg-bench — embedding backend benchmark rig
 
-Compares embedding **mechanisms** (CPU vs CoreML ANE/GPU vs candle Metal) and
-**models** on one fixed workload, on Apple silicon, within a memory budget.
-See [RESULTS.md](RESULTS.md) for findings.
+Compares embedding **mechanisms** and CPU/session configurations on one fixed
+workload within a memory budget. The ONNX CPU rig and RSS watchdog work on
+Linux and macOS; accelerator backends are Apple-specific. See
+[RESULTS.md](RESULTS.md) for findings.
 
 ## Build
 
@@ -22,9 +23,16 @@ Extracts a repo's chunk texts with the production chunker into a stable file:
 ## 2. Run a backend
 
 ```sh
-# CPU baseline (today's design): N fastembed sessions
+# Previous production baseline on an 8-vCPU machine
 ./target/release/bench --corpus bench/corpus/exe.bin --backend onnx-cpu \
-    --model minilm --sessions 8 --batch 16 --sort
+    --model minilm --sessions 1 --threads 8 --batch 16 --group 512 \
+    --sort --limit 4096 --warmup 256
+
+# Faster CPU default: one unpadded text at a time across 8 sessions.
+# --group 64/session matches the indexer's 512-chunk checkpoint bound.
+./target/release/bench --corpus bench/corpus/exe.bin --backend onnx-cpu \
+    --model minilm --sessions 8 --threads 1 --batch 1 --group 64 \
+    --sort --limit 4096 --warmup 256
 
 # Fixed-shape direct ORT on CPU — the fast, low-memory path
 ./target/release/bench --corpus bench/corpus/exe.bin --backend onnx-direct \
@@ -40,9 +48,10 @@ Extracts a repo's chunk texts with the production chunker into a stable file:
 ```
 
 Every run is under a **memory watchdog** (`--budget-gb`, default 16) that aborts
-the process before RSS can exhaust RAM. Use `--limit N` to run on a subset,
-`--warmup N` to exclude one-time compile/cache costs, and `--dump`/`--compare`
-to check two backends agree (cosine).
+the process before RSS can exhaust RAM. Use `--limit N` to run on a stable
+SHA-ordered subset, `--warmup N` to exclude one-time costs, and `--group N` to
+bound the texts retained by each fastembed session. `--dump`/`--compare` check
+two backends agree (cosine); `cmp` can additionally prove byte-identical output.
 
 ## Backends
 

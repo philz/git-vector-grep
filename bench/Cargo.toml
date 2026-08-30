@@ -27,7 +27,6 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
-mach2 = "0.4"
 # Used by the direct-ort (fixed-shape CoreML/ANE) backend and candle backend.
 tokenizers = "0.20"
 hf-hub = "0.5"
@@ -39,3 +38,6 @@ ureq = { version = "2", features = ["json"] }
 candle-core = { version = "0.8", optional = true, features = ["metal"] }
 candle-nn = { version = "0.8", optional = true, features = ["metal"] }
 candle-transformers = { version = "0.8", optional = true, features = ["metal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"

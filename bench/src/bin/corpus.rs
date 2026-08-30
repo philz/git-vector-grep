@@ -53,7 +53,10 @@ fn main() -> Result<()> {
     for (path, sha) in &pairs {
         sha_to_path.entry(sha.clone()).or_insert_with(|| path.clone());
     }
-    let blobs: Vec<(String, String)> = sha_to_path.into_iter().collect();
+    let mut blobs: Vec<(String, String)> = sha_to_path.into_iter().collect();
+    // HashMap iteration is randomized. SHA order makes regenerated corpora
+    // byte-for-byte stable and gives --limit a reproducible sample.
+    blobs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let texts: Vec<String> = blobs
         .par_iter()

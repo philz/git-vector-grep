@@ -76,7 +76,14 @@ Global flags:
 
 - `--model {minilm,bge-small,bge-small-q,bge-base,jina-code}` — default
   `minilm` (`sentence-transformers/all-MiniLM-L6-v2`, 384-D, ~85 MB ONNX).
-- `--workers N` — parallel ONNX sessions (default: auto-sized by RAM).
+- `--workers N` — override CPU/ONNX parallelism. MiniLM and BGE-small variants
+  auto-size up to 8 sessions from CPU count and the lower of host or cgroup RAM,
+  reserving at least 1.5 GiB and 25% of RAM. Larger `bge-base` and `jina-code`
+  models retain the safe one-session default unless explicitly overridden.
+  Only one session is loaded for cached searches; additional sessions initialize
+  lazily after the cache scan finds chunks that actually need embedding.
+- `--batch-size N` — override the embedding batch. Defaults to 1 on CPU/ONNX
+  (avoids padding variable-length code chunks) and 16 on MLX.
 - `--repo PATH` — operate on a repo other than `$PWD`.
 
 First run of a given model downloads the ONNX weights from HuggingFace
@@ -125,7 +132,34 @@ See `bench/RESULTS.md` for the full backend comparison.
 
 ## Performance
 
-8-CPU / 8 GB Zen 4 VM, MiniLM, CPU only:
+CPU embedding microbenchmark, August 30, 2026: 8-vCPU AMD EPYC 9554P,
+16 GiB RAM, MiniLM, 4,096 production chunks from `exe`, three warmed runs.
+The benchmark caps each fastembed call to the production-equivalent 512 total
+chunks and reports median wall time.
+
+| CPU configuration | batch | chunks/s | peak RSS |
+|-------------------|------:|---------:|---------:|
+| old default: 1 session × 8 intra-threads | 16 | 33 | 1.20 GB |
+| new default: 8 sessions × 1 intra-thread | 1 | **74** | 1.40 GB |
+
+That is **2.26× throughput** for about 0.20 GB additional peak RSS. A
+256-vector comparison was byte-identical between configurations. Every tested
+larger CPU batch was slower and consumed more memory on this variable-length
+workload. An additional three-run, baseline/candidate-interleaved check while
+three unrelated VM processes each consumed about one CPU core still measured a
+**2.21× median speedup** (35→77 chunks/s), with median peak RSS of 1.19→1.37 GB.
+A post-lazy-loading end-to-end index of 1,024 corpus-derived files measured
+30.46s→13.86s (**2.20×**) with median peak RSS of 1.18→1.40 GB, including lazy
+worker creation and git-note commits. See `bench/README.md` for reproduction
+commands.
+
+Cached-search validation on August 31, 2026 used a fully indexed 128-file repo
+with normal auto-index enabled. Loading only the eager session reduced median
+startup from 0.50s to 0.22s and median peak RSS from 0.97 GB to 0.17 GB. On the
+large `exe` cache with `--no-auto-index`, median wall time fell from 2.69s to
+2.38s and median peak RSS from 1.30 GB to 0.45 GB.
+
+Older end-to-end reference, 8-CPU / 8 GB Zen 4 VM, MiniLM, CPU only:
 
 |                           | files | chunks | cold index | incremental | search |
 |---------------------------|-------|--------|-----------:|------------:|-------:|

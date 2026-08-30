@@ -3,20 +3,111 @@
 **Question.** Embedding `~/src/exe` is slow. Can we go faster — ideally by using
 the M4 Max GPU or Neural Engine — within a **16 GB** memory budget?
 
-**Short answer.** Two wins, depending on appetite:
-1. **GPU (MLX) is the fastest** — MiniLM/bge on the Apple GPU via MLXEmbedders:
-   **~405–500 chunks/s in 0.27 GB at full ≤512-token context**, embeddings
-   verified correct (8/8 retrieval). Needs a Swift helper + a one-time Metal
-   Toolchain install. Full exe in ~3 min, CPU cores left free.
-2. **CPU is the easy win** — one multi-threaded ONNX session (not N
-   memory-hungry ones) at a chunk-sized `seq_len`: **1.7–3× faster and ~30× less
-   memory** than today's path, a small change to the shipping Rust tool.
+**Short answer.** Two production-safe wins, depending on platform:
+1. **GPU (MLX) is the fastest on Apple Silicon** — MiniLM/bge on the Apple GPU
+   reaches **~405–500 chunks/s in 0.27 GB at full ≤512-token context**.
+2. **CPU/ONNX should not batch variable-length code chunks together.** On the
+   target 8-vCPU AMD EPYC VM, batch 1 across eight single-thread sessions is
+   **2.26× faster** than one eight-thread session at batch 16, with only
+   0.20 GB additional peak RSS and byte-identical embeddings.
+
+A direct fixed-sequence ONNX path remains an interesting Apple CPU experiment,
+but shortening `seq_len` truncates inputs and therefore was not shipped.
 
 The dead ends (all verified): the ONNX **CoreML EP partitions BERT and falls
 back to CPU** (ANE=GPU=CPU); **candle Metal** is too unoptimized (~30/s); and
 Apple's **`afm` server serializes** (~57/s) — though its underlying
 `NLContextualEmbedding` parallelizes to ~400/s when you skip the actor + HTTP.
 The GPU only wins with an *optimized* runtime (MLX) + large batches.
+
+## Linux CPU follow-up — August 30, 2026
+
+Machine: 8-vCPU AMD EPYC 9554P, 16 GiB RAM. Workload: a deterministic,
+SHA-ordered corpus extracted from the current `exe` checkout with the production
+chunker (131,715 chunks total); each run uses the first 4,096 chunks, sorted by
+length, after a 256-chunk warmup. Values are medians of three runs.
+
+| configuration | batch | fastembed group/session | chunks/s | peak RSS |
+|---|---:|---:|---:|---:|
+| previous default: 1 session × 8 threads | 16 | 512 | 33 | 1.20 GB |
+| new default: 8 sessions × 1 thread | 1 | 64 | **74** | 1.40 GB |
+
+The new configuration takes 55.39 s versus 124.91 s: **2.26× throughput**.
+A one-session screen found batch 1 faster than 4–128, while eight-session tests
+found batches 2, 3, 4, 8, and 16 slower than 1; batch 256 crossed the 8 GB
+watchdog limit. A 256-vector dump from the two configurations compared at mean
+and worst cosine 1.00000 and was byte-for-byte identical.
+
+A second validation deliberately ran under active CPU contention: three
+unrelated `cloud-hypervisor` processes each held about one CPU core, and load
+average rose from 5.29 to 14.44 during the sequence. Three 2,048-chunk runs per
+configuration were alternated baseline/candidate to avoid ordering bias:
+
+| configuration | run times (s) | median chunks/s | median peak RSS |
+|---|---|---:|---:|
+| 1 session × 8 threads, batch 16 | 58.75, 58.85, 58.83 | 35 | 1.19 GB |
+| 8 sessions × 1 thread, batch 1 | 26.62, 28.03, 25.28 | **77** | 1.37 GB |
+
+The contended median remained a **2.21× speedup**, with 0.18 GB additional
+median peak RSS.
+
+## Final review validation — August 31, 2026
+
+### End-to-end indexing after lazy initialization
+
+The final shipping binary was run against 1,024 files made from the deterministic
+production corpus. The cache ref was deleted before every run, and three
+baseline/candidate runs were interleaved under active CPU contention. These
+numbers include model/session initialization, embedding, and git-note commits:
+
+| configuration | run times (s) | median chunks/s | median peak RSS |
+|---|---|---:|---:|
+| 1 session × 8 threads, batch 16 | 29.55, 30.46, 30.66 | 34 | 1.18 GB |
+| lazy 8 sessions × 1 thread, batch 1 | 13.86, 14.00, 13.73 | **74** | 1.40 GB |
+
+The complete indexing path retains a **2.20× median speedup**, including lazy
+worker creation. A separate 128-file run with an empty `XDG_CACHE_HOME`
+successfully downloaded the model through the eager session before parallel
+workers initialized, then completed indexing without Hugging Face lock errors.
+
+### Cached-search session loading
+
+The shipping CPU embedder now creates one session eagerly and initializes the
+remaining planned workers only when `embed_flat` is reached. Since `index_repo`
+checks the cache before calling `embed_flat`, a cached auto-index search never
+loads the extra sessions. Three eager/lazy runs were interleaved:
+
+| workload | eager-all median | lazy median | peak RSS, eager → lazy |
+|---|---:|---:|---:|
+| cached 128-file repo, auto-index enabled | 0.50s | **0.22s** | 0.97 → **0.17 GB** |
+| large `exe` cache, `--no-auto-index` | 2.69s | **2.38s** | 1.30 → **0.45 GB** |
+
+### Larger-model batch check
+
+BGE-base and Jina remain capped at one automatic worker. Three interleaved
+128-chunk runs under the same CPU contention found no batch-1 regression, so
+all CPU models retain the semantics-preserving batch-1 default:
+
+| model | batch 1 median | batch 16 median | peak RSS, batch 1 → 16 |
+|---|---:|---:|---:|
+| BGE-base | **20.12s** (6.36/s) | 21.87s (5.85/s) | 0.64 → 1.15 GB |
+| Jina-code | **24.06s** (5.32/s) | 24.96s (5.13/s) | 0.82 → 1.42 GB |
+
+The first ONNX session is also initialized synchronously before any lazy worker
+can initialize in parallel. This completes fresh-cache Hugging Face downloads
+before parallel access and avoids model-cache lock races.
+
+```sh
+# baseline
+./target/release/bench --corpus bench/corpus/exe.bin --backend onnx-cpu \
+  --model minilm --sessions 1 --threads 8 --batch 16 --group 512 \
+  --sort --limit 4096 --warmup 256
+
+# candidate (512 total retained texts / 8 sessions = group 64)
+./target/release/bench --corpus bench/corpus/exe.bin --backend onnx-cpu \
+  --model minilm --sessions 8 --threads 1 --batch 1 --group 64 \
+  --sort --limit 4096 --warmup 256
+```
 
 ## Rig (pure Rust, in `bench/`)
 
@@ -25,11 +116,11 @@ The GPU only wins with an *optimized* runtime (MLX) + large batches.
   7,159 unique blobs, 49.7 MB), extracted with the production chunker.
   Build with `cargo run -p vgg-bench --release --bin corpus -- --repo ~/src/exe --out bench/corpus/exe.bin`.
 - **Runner** `bench/src/bin/bench.rs`: one backend per process under a
-  **memory watchdog** (`--budget-gb`, default 16) that aborts before RSS can
-  exhaust RAM. Reports chunks/s, peak RSS, init time; `--dump`/`--compare`
-  check two backends agree (cosine).
+  Linux/macOS **memory watchdog** (`--budget-gb`, default 16) that aborts before
+  RSS can exhaust RAM. Reports chunks/s, peak RSS, init time;
+  `--dump`/`--compare` check two backends agree (cosine).
 - **Backends** (`bench/src/backends/`):
-  - `onnx-cpu` — fastembed, N sessions × intra-threads (today's design).
+  - `onnx-cpu` — fastembed, N sessions × intra-threads.
   - `onnx-coreml` — fastembed + CoreML EP (ANE/GPU), dynamic shapes.
   - `onnx-direct` — direct `ort`, **fixed `[batch, seq_len]`** shapes, CPU or
     CoreML (ANE/GPU). Mean-pooled.
@@ -153,26 +244,32 @@ same cores.
    85.8k chunks at once needs tens of GB; the watchdog aborted it at 16 GB. Both
    the shipping indexer and the rig bound this by calling `embed()` in groups.
 
-### The actual win is CPU shape + session strategy
-- **One multi-threaded ORT session** uses all cores in **<0.7 GB**. Today's
-  8-session design hits 248 chunks/s but **12.8 GB** — it's memory-bound and
-  can't scale to all 16 cores within budget.
-- **`seq_len` dominates throughput.** Chunks are ≤1000 chars (~250 tokens) but
-  most are far shorter. Capping the model's sequence length is near-linear:
-  256→167, 128→410, 64→779 chunks/s. seq 128 keeps ~500 chars/chunk and already
-  **beats the current design 1.7× at 1/30th the memory**.
+### Platform-specific CPU findings
+- On the **AMD EPYC Linux target**, fastembed's dynamic `BatchLongest` padding
+  makes batch 1 fastest for mixed-length code. Eight single-thread sessions
+  keep all eight cores busy at 74 chunks/s and 1.40 GB peak RSS.
+- On the **M4 Max fixed-shape experiment**, one multi-threaded direct-ORT
+  session was memory-efficient, and shorter fixed sequence lengths were fast.
+  That path was not shipped because truncating to 64/128/256 tokens can change
+  embeddings for longer chunks.
 
 ## Recommendation
 
-For the shipping tool (no accelerator needed):
-1. Replace N fastembed sessions with **one session, default intra-threads**
-   (all cores), in <1 GB.
-2. Make **`seq_len` a tunable** and default it to ~128 (or shrink the chunker so
-   chunks fit ~128 tokens). 1.7–3× faster indexing of exe, ~30× less RAM.
-3. Keep CoreML/candle out of the hot path — they don't pay off here.
+For the shipping CPU backend, retain fastembed's full model context and use:
+1. **batch 1** by default, eliminating padding between unrelated code chunks;
+2. up to **eight RAM-capped sessions** for MiniLM/BGE-small, with intra-op
+   threads divided among them; larger BGE-base/Jina models retain the previous
+   one-session default unless `--workers N` explicitly opts in;
+3. bounded per-session calls so each index checkpoint retains about 512 texts
+   total.
 
-Projected full exe (85,798 chunks): today ≈ **5.7 min**; seq-128 single-session
-≈ **3.5 min**; seq-64 ≈ **1.8 min** — all in well under 1 GB.
+The automatic worker policy is deliberately conservative outside the measured
+small-model path: it reserves at least 1.5 GiB and 25% of the lower of host or
+cgroup memory (`memory.max` on v2 and common `memory.limit_in_bytes` v1
+layouts), caps MiniLM/BGE-small at eight workers, falls back to one worker when
+RAM cannot be detected, and leaves BGE-base/Jina at one worker by default.
+Only the first session is eager; additional workers are initialized after the
+cache scan proves embedding work exists.
 
-_Caveat:_ shortening `seq_len` truncates long chunks (a quality trade-off);
-mean-pooling in `onnx-direct` matches minilm/jina but **not** BGE (CLS-pooled).
+Keep CoreML/candle and sequence-length truncation out of the CPU hot path: none
+provided a semantics-preserving win on this target.

@@ -30,6 +30,10 @@ struct Args {
     /// Per-call batch size.
     #[arg(long, default_value_t = 16)]
     batch: usize,
+    /// Texts per fastembed call, per session. Production uses roughly
+    /// 512 / sessions so one index checkpoint holds about 512 texts total.
+    #[arg(long, default_value_t = 512)]
+    group: usize,
     /// ONNX CPU: number of parallel sessions (ignored for CoreML/candle).
     #[arg(long, default_value_t = 0)]
     sessions: usize,
@@ -85,6 +89,7 @@ fn build_backend(args: &Args) -> Result<Box<dyn Backend>> {
                 OnnxProvider::Cpu,
                 sessions,
                 args.threads,
+                args.group,
             )?))
         }
         "onnx-coreml" => {
@@ -104,6 +109,7 @@ fn build_backend(args: &Args) -> Result<Box<dyn Backend>> {
                 },
                 1,
                 args.threads,
+                args.group,
             )?))
         }
         "afm-http" => {

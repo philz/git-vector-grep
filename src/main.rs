@@ -31,10 +31,9 @@ struct Cli {
     #[arg(long, global = true, default_value = "minilm")]
     model: String,
 
-    /// Number of ONNX sessions (CPU backend). Default 1: a single session that
-    /// uses all cores via intra-op threads, in one memory arena (~1 GB). Each
-    /// extra session adds another full model + arena, so raise this only to
-    /// trade memory for parallelism on a big-RAM machine.
+    /// Number of ONNX sessions (CPU backend). Small models auto-size up to 8,
+    /// capped by CPU count and the lower of host/cgroup RAM; bge-base and
+    /// jina-code default to one session. Use --workers N to override.
     #[arg(long, global = true)]
     workers: Option<usize>,
 
@@ -76,9 +75,10 @@ struct SearchArgs {
     quiet: bool,
     #[arg(short, long)]
     verbose: bool,
-    /// ONNX batch size per worker. Lower if you OOM.
-    #[arg(long, default_value_t = 16)]
-    batch_size: usize,
+    /// Embedding batch size. Defaults to 1 for CPU/ONNX and 16 for MLX.
+    /// Larger CPU batches can waste work padding code chunks to equal length.
+    #[arg(long)]
+    batch_size: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,9 +90,9 @@ enum Cmd {
         /// Suppress indexing progress output.
         #[arg(short, long)]
         quiet: bool,
-        /// ONNX batch size per worker. Lower if you OOM; 8 is conservative.
-        #[arg(long, default_value_t = 16)]
-        batch_size: usize,
+        /// Embedding batch size. Defaults to 1 for CPU/ONNX and 16 for MLX.
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
     /// Search the repo. Will refresh the cache first unless --no-auto-index.
     Search(SearchArgs),
@@ -144,6 +144,13 @@ fn want_mlx(cli: &Cli) -> bool {
             }
         }
     }
+}
+
+fn effective_batch_size(
+    requested: Option<usize>,
+    embedder: &dyn git_vector_grep::embed::Embed,
+) -> usize {
+    requested.unwrap_or_else(|| embedder.default_batch_size()).max(1)
 }
 
 fn build_embedder(cli: &Cli) -> Result<Box<dyn git_vector_grep::embed::Embed>> {
@@ -199,6 +206,7 @@ fn main() -> Result<()> {
         Cmd::Index { verbose, quiet, batch_size } => {
             let t0 = Instant::now();
             let emb = build_embedder(&cli)?;
+            let batch_size = effective_batch_size(batch_size, emb.as_ref());
             let mut s = Store::open(&root, emb.short_id(), emb.dim())?;
             if verbose {
                 eprintln!(
@@ -233,6 +241,7 @@ fn main() -> Result<()> {
             let quiet = quiet || json;
 
             let emb = build_embedder(&cli)?;
+            let batch_size = effective_batch_size(batch_size, emb.as_ref());
             let mut s = Store::open(&root, emb.short_id(), emb.dim())?;
 
             if !no_auto_index {
@@ -457,4 +466,38 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_batch_size;
+    use anyhow::Result;
+    use git_vector_grep::embed::Embed;
+
+    struct CpuLike;
+
+    impl Embed for CpuLike {
+        fn embed_flat(&self, _texts: Vec<String>, _batch_size: usize) -> Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+        fn default_batch_size(&self) -> usize {
+            1
+        }
+        fn dim(&self) -> usize {
+            384
+        }
+        fn short_id(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[test]
+    fn backend_default_batch_is_used_unless_overridden() {
+        let embedder = CpuLike;
+        assert_eq!(effective_batch_size(None, &embedder), 1);
+        assert_eq!(effective_batch_size(Some(16), &embedder), 16);
+    }
 }

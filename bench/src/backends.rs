@@ -61,6 +61,7 @@ impl OnnxBackend {
         provider: OnnxProvider,
         n_sessions: usize,
         intra_threads: usize,
+        group: usize,
     ) -> Result<Self> {
         let choice: ModelChoice = parse_model(model)?;
         let n_sessions = n_sessions.max(1);
@@ -95,10 +96,7 @@ impl OnnxBackend {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        let group = std::env::var("VGG_GROUP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(512);
+        let group = group.max(1);
 
         Ok(OnnxBackend {
             label,

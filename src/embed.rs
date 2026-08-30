@@ -13,6 +13,12 @@ pub trait Embed: Send + Sync {
     fn embed_flat(&self, texts: Vec<String>, batch_size: usize) -> Result<Vec<f32>>;
     /// Embed a single query string (L2-normalized).
     fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
+    /// Backend-specific default batch size. CPU/ONNX prefers one text per
+    /// dynamic-shape batch to avoid padding; accelerator backends may prefer
+    /// larger batches.
+    fn default_batch_size(&self) -> usize {
+        16
+    }
     fn dim(&self) -> usize;
     /// Stable slug used as the notes-ref segment (`[a-z0-9-]+`).
     fn short_id(&self) -> &str;
