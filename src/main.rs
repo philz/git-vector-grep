@@ -16,7 +16,7 @@ use search::Index;
 #[derive(Parser, Debug)]
 #[command(
     name = "git-vector-grep",
-    version,
+    version = env!("GIT_VECTOR_GREP_VERSION"),
     about = "Semantic (vector) code search over a git repo: embeds your tracked \
              text files locally on CPU, caches the vectors in git, and ranks \
              chunks by meaning rather than exact keywords.",

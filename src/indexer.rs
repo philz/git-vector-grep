@@ -101,6 +101,23 @@ pub fn list_tracked_with_blobs(root: &Path) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+fn incremental_progress_message(
+    total_chunks: usize,
+    new_blobs: usize,
+    cached_blobs: usize,
+    total_blobs: usize,
+) -> String {
+    let reuse_percent = cached_blobs
+        .saturating_mul(100)
+        .checked_div(total_blobs)
+        .unwrap_or(100);
+    let chunk_suffix = if total_chunks == 1 { "" } else { "s" };
+    let blob_suffix = if new_blobs == 1 { "" } else { "s" };
+    format!(
+        "indexing: cache contains {cached_blobs}/{total_blobs} blobs ({reuse_percent}%); embedding {total_chunks} new chunk{chunk_suffix} from {new_blobs} blob{blob_suffix}..."
+    )
+}
+
 pub fn index_repo(
     root: &Path,
     cache: &mut Store,
@@ -206,9 +223,13 @@ pub fn index_repo(
         );
     } else if show_progress {
         eprintln!(
-            "indexing: embedding {} new chunks from {} blobs...",
-            total_chunks,
-            chunked.len(),
+            "{}",
+            incremental_progress_message(
+                total_chunks,
+                chunked.len(),
+                stats.blobs_already_cached,
+                stats.blobs_unique,
+            )
         );
     }
 
@@ -309,4 +330,25 @@ pub fn index_repo(
 
     stats.elapsed_ms = t0.elapsed().as_millis();
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::incremental_progress_message;
+
+    #[test]
+    fn progress_reports_cache_reuse() {
+        assert_eq!(
+            incremental_progress_message(19_937, 388, 9_752, 10_140),
+            "indexing: cache contains 9752/10140 blobs (96%); embedding 19937 new chunks from 388 blobs..."
+        );
+    }
+
+    #[test]
+    fn progress_does_not_round_partial_cache_to_one_hundred_percent() {
+        assert_eq!(
+            incremental_progress_message(1, 1, 10_139, 10_140),
+            "indexing: cache contains 10139/10140 blobs (99%); embedding 1 new chunk from 1 blob..."
+        );
+    }
 }
